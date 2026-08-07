@@ -1,51 +1,47 @@
 using System.Reflection;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using SPTarkov.Common.Models.Logging;
 using SPTarkov.DI.Annotations;
 using SPTarkov.Server.Core.DI;
-using SPTarkov.Server.Core.Helpers;
-using SPTarkov.Server.Core.Models.Logging;
+using SPTarkov.Server.Core.Helpers.Server;
 using SPTarkov.Server.Core.Models.Spt.Mod;
-using SPTarkov.Server.Core.Models.Utils;
-using SPTarkov.Server.Core.Servers;
-using SPTarkov.Server.Core.Services;
-using SPTarkov.Server.Core.Models.Eft.Common.Tables;
+using SPTarkov.Server.Core.Models.Spt.Tables;
+using SPTarkov.Server.Core.Services.Locales;
+using Spectre.Console;
 
 namespace SimpleTranslatorCS;
 
-public record ModMetadata : AbstractModMetadata
+public record ModMetadata : IModMetadata
 {
-    public override string ModGuid { get; init; } = "com.simple.translator.cs";
-    public override string Name { get; init; } = "SimpleTranslatorCS";
-    public override string Author { get; init; } = "MiKueYu";
-    public override List<string>? Contributors { get; init; }
-    public override SemanticVersioning.Version Version { get; init; } = new("1.1.1");
-    public override SemanticVersioning.Range SptVersion { get; init; } = new("~4.0.0");
-
-    public override List<string>? Incompatibilities { get; init; }
-    public override Dictionary<string, SemanticVersioning.Range>? ModDependencies { get; init; }
-    public override string? Url { get; init; }
-    public override bool? IsBundleMod { get; init; } = false;
-    public override string? License { get; init; } = "MIT";
+    public string ModGuid { get; init; } = "com.simple.translator.cs";
+    public string Name { get; init; } = "SimpleTranslatorCS";
+    public string Author { get; init; } = "MiKueYu";
+    public List<string>? Contributors { get; init; }
+    public SemanticVersioning.Version Version { get; init; } = new("1.2.0");
+    public SemanticVersioning.Range SptVersion { get; init; } = new("~4.1.0");
+    public bool HasPrepatcher { get; init; } = false;
+    public List<string>? Incompatibilities { get; init; }
+    public Dictionary<string, SemanticVersioning.Range>? ModDependencies { get; init; }
+    public string? Url { get; init; }
+    public string License { get; init; } = "MIT";
 }
 
-[Injectable(TypePriority = OnLoadOrder.PostSptModLoader + 1)]
+[Injectable(TypePriority = OnLoadOrder.PostLoad)]
 public class SimpleTranslator(
     ISptLogger<SimpleTranslator> logger,
-    DatabaseServer databaseServer,
     ModHelper modHelper,
     LocaleService localeService,
-    DatabaseService databaseService) : IOnLoad
+    LocaleTable localeTable,
+    TemplateTable templateTable) : IOnLoad
 {
     // 预编译正则表达式以提高性能
     private static readonly Regex JsonTrailingCommaRegex = new(@",\s*(\}|\])", RegexOptions.Compiled);
     private static readonly Regex JsonBlockCommentRegex = new(@"/\*[\s\S]*?\*/", RegexOptions.Compiled);
     private static readonly Regex JsonLineCommentRegex = new(@"^\s*//.*$", RegexOptions.Compiled | RegexOptions.Multiline);
 
-    public Task OnLoad()
+    public Task OnLoadAsync(CancellationToken cancellationToken)
     {
-        var tables = databaseServer.GetTables();
-
         // 目标语言
         var serverLocales = new[] { "ch" };
         var loadedFileCount = 0;
@@ -84,7 +80,7 @@ public class SimpleTranslator(
                 var coveredFields = content.Keys.Count(k => referenceLocales.ContainsKey(k));
 
                 // 目标语言容器必须存在
-                if (!tables.Locales.Global.TryGetValue(locale, out var lazyTarget))
+                if (!localeTable.Global.TryGetValue(locale, out var lazyTarget))
                 {
                     logger.Warning($"目标语言 {locale} 在数据库中不存在，跳过该语言覆盖");
                     continue;
@@ -93,10 +89,7 @@ public class SimpleTranslator(
                 // 在目标语言上追加 transformer 以合并我们的更改（加入空字典保护）
                 lazyTarget.AddTransformer(targetDict =>
                 {
-                    if (targetDict == null)
-                    {
-                        targetDict = new Dictionary<string, string>();
-                    }
+                    targetDict ??= new GlobalLocaleDictionary();
 
                     foreach (var kvp in content)
                     {
@@ -281,7 +274,7 @@ public class SimpleTranslator(
 
         if (fullyCoveredFiles.Count > 0)
         {
-            logger.LogWithColor($"[文本汉化]完全覆盖 文本列表:", LogTextColor.Green, LogBackgroundColor.Black);
+            logger.LogWithColor($"[文本汉化]完全覆盖 文本列表:", Color.Green, Color.Black);
             foreach (var f in fullyCoveredFiles)
             {
                 logger.Info($"  - {f} ");
@@ -291,7 +284,7 @@ public class SimpleTranslator(
 
         if (partiallyCoveredFiles.Count > 0)
         {
-            logger.LogWithColor($"[文本汉化]部分覆盖 文本列表:", LogTextColor.Yellow, LogBackgroundColor.Black);
+            logger.LogWithColor($"[文本汉化]部分覆盖 文本列表:", Color.Yellow, Color.Black);
             foreach (var f in partiallyCoveredFiles)
             {
                 logger.Info($"  - {f.fileName} ({f.covered}/{f.total} 字段)");
@@ -301,7 +294,7 @@ public class SimpleTranslator(
 
         if (nonCoveredFiles.Count > 0)
         {
-            logger.LogWithColor($"[文本汉化]未覆盖 文本列表:", LogTextColor.Red, LogBackgroundColor.Black);
+            logger.LogWithColor($"[文本汉化]未覆盖 文本列表:", Color.Red, Color.Black);
             foreach (var f in nonCoveredFiles)
             {
                 logger.Info($"  - {f}");
@@ -354,7 +347,7 @@ public class SimpleTranslator(
                     continue;
                 }
 
-                var dialogue = databaseService.GetTemplates().Dialogue;
+                var dialogue = templateTable.Dialogue;
                 if (dialogue?.Elements == null)
                 {
                     logger.Warning("[Dialogue本地化]无法获取 dialogue 数据");
@@ -375,7 +368,6 @@ public class SimpleTranslator(
                         element.LocalizationDictionary[locale] = localeDict;
                     }
 
-                    var originalCount = localeDict.Count;
                     var textsUpdated = 0;
 
                     // 只更新匹配的文本ID（如果 element 的 localization 中有这些文本ID）
