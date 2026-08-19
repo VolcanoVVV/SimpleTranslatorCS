@@ -1,5 +1,7 @@
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
+using System.Text.Unicode;
 
 namespace SimpleTranslatorCS;
 
@@ -12,6 +14,12 @@ namespace SimpleTranslatorCS;
 /// </summary>
 internal sealed class TranslationReport
 {
+    // 保留中文原文（不转义为 \uXXXX），否则报告在记事本里显示为转义序列
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        Encoder = JavaScriptEncoder.Create(UnicodeRanges.All)
+    };
+
     private readonly List<(string file, string key, string value, bool covered)> _localeEntries = new();
     private readonly List<(string file, string key, string value, bool covered)> _dialogueEntries = new();
     private readonly List<(string key, string firstFile, string overrideFile)> _conflicts = new();
@@ -76,7 +84,8 @@ internal sealed class TranslationReport
             }
 
             sb.AppendLine("}");
-            File.WriteAllText(path, sb.ToString());
+            // 带 BOM 的 UTF-8：让记事本等编辑器正确识别编码，避免中文按 ANSI 显示为乱码
+            File.WriteAllText(path, sb.ToString(), new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
             info($"[文本汉化]词条生效报告已导出: {path}（生效 {coveredCount}/{totalCount}）");
         }
         catch (Exception ex)
@@ -107,7 +116,7 @@ internal sealed class TranslationReport
             {
                 sb.AppendLine(e.covered ? "    // [生效]" : "    // [未生效]");
                 // JsonSerializer.Serialize 负责引号包裹与转义，保证报告本身是合法 jsonc
-                sb.AppendLine($"    {JsonSerializer.Serialize(e.key)}: {JsonSerializer.Serialize(e.value)},");
+                sb.AppendLine($"    {JsonSerializer.Serialize(e.key, JsonOptions)}: {JsonSerializer.Serialize(e.value, JsonOptions)},");
             }
         }
     }

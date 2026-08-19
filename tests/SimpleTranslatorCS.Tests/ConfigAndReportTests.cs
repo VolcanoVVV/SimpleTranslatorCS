@@ -103,6 +103,11 @@ public class TranslationReportTests
         Assert.AreEqual("未生效条目", doc.RootElement.GetProperty("key2").GetString());
         Assert.AreEqual("对话文本", doc.RootElement.GetProperty("dlg1").GetString());
 
+        // 中文必须原样输出（不被转义为 \uXXXX），且文件带 UTF-8 BOM 供记事本识别
+        StringAssert.Contains(raw, "未生效条目");
+        StringAssert.Contains(raw, "对话文本");
+        Assert.IsTrue(File.ReadAllBytes(path).Take(3).SequenceEqual(new byte[] { 0xEF, 0xBB, 0xBF }), "报告文件应带 UTF-8 BOM");
+
         // 各章节与统计
         StringAssert.Contains(raw, "普通本地化");
         StringAssert.Contains(raw, "Dialogue 对话");
