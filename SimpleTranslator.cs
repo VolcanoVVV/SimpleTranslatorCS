@@ -1,24 +1,61 @@
 using System.Reflection;
-using System.Text.Json;
-using System.Text.RegularExpressions;
-using SPTarkov.Common.Models.Logging;
 using SPTarkov.DI.Annotations;
 using SPTarkov.Server.Core.DI;
-using SPTarkov.Server.Core.Helpers.Server;
 using SPTarkov.Server.Core.Models.Spt.Mod;
-using SPTarkov.Server.Core.Models.Spt.Tables;
-using SPTarkov.Server.Core.Services.Locales;
-using Spectre.Console;
+#if SPT40
+// SPT 4.0 的 API 布局（dotnet build -c "4.0 Release"）
+using SPTarkov.Server.Core.Helpers;        // ModHelper
+using SPTarkov.Server.Core.Models.Logging; // LogBackgroundColor
+using SPTarkov.Server.Core.Models.Utils;   // ISptLogger<T>
+using SPTarkov.Server.Core.Servers;        // DatabaseServer
+using SPTarkov.Server.Core.Services;       // LocaleService
+// 4.0 的日志颜色是自己的枚举，起别名让调用处与 4.1 的 Spectre.Console.Color 写法一致
+using Color = SPTarkov.Server.Core.Models.Logging.LogTextColor;
+#else
+// SPT 4.1 的 API 布局（默认 dotnet build）
+using SPTarkov.Common.Models.Logging;         // ISptLogger<T>
+using SPTarkov.Server.Core.Helpers.Server;    // ModHelper
+using SPTarkov.Server.Core.Models.Spt.Tables; // LocaleTable / TemplateTable / GlobalLocaleDictionary
+using SPTarkov.Server.Core.Services.Locales;  // LocaleService
+using Spectre.Console;                        // Color
+#endif
 
 namespace SimpleTranslatorCS;
 
+// 版本号单一来源是 csproj 的 <Version>，这里从程序集元数据读回，发版只需改 csproj
+internal static class ModInfo
+{
+    public static readonly string Version =
+        typeof(ModInfo).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+        ?? "1.4.0";
+}
+
+#if SPT40
+// SPT 4.0：元数据是 record 继承 AbstractModMetadata（属性全为 abstract，必须 override；
+// 4.0 没有 HasPrepatcher，多一个 IsBundleMod）
+public record ModMetadata : AbstractModMetadata
+{
+    public override string ModGuid { get; init; } = "com.simple.translator.cs";
+    public override string Name { get; init; } = "SimpleTranslatorCS";
+    public override string Author { get; init; } = "MiKueYu & Volcano";
+    public override List<string>? Contributors { get; init; }
+    public override SemanticVersioning.Version Version { get; init; } = new(ModInfo.Version);
+    public override SemanticVersioning.Range SptVersion { get; init; } = new("~4.0.0");
+    public override List<string>? Incompatibilities { get; init; }
+    public override Dictionary<string, SemanticVersioning.Range>? ModDependencies { get; init; }
+    public override string? Url { get; init; }
+    public override bool? IsBundleMod { get; init; }
+    public override string License { get; init; } = "MIT";
+}
+#else
+// SPT 4.1：元数据是 record 实现 IModMetadata
 public record ModMetadata : IModMetadata
 {
     public string ModGuid { get; init; } = "com.simple.translator.cs";
     public string Name { get; init; } = "SimpleTranslatorCS";
-    public string Author { get; init; } = "MiKueYu";
+    public string Author { get; init; } = "MiKueYu & Volcano";
     public List<string>? Contributors { get; init; }
-    public SemanticVersioning.Version Version { get; init; } = new("1.2.0");
+    public SemanticVersioning.Version Version { get; init; } = new(ModInfo.Version);
     public SemanticVersioning.Range SptVersion { get; init; } = new("~4.1.0");
     public bool HasPrepatcher { get; init; } = false;
     public List<string>? Incompatibilities { get; init; }
@@ -26,24 +63,45 @@ public record ModMetadata : IModMetadata
     public string? Url { get; init; }
     public string License { get; init; } = "MIT";
 }
+#endif
 
-[Injectable(TypePriority = OnLoadOrder.PostLoad)]
+#if SPT40
+// 4.0 没有 LocaleTable/TemplateTable 注入，通过 DatabaseServer.GetTables() 取表。
+// 加载顺序：大多数 mod 在 PostDBModLoader 档执行，翻译 mod 必须排在它们之后，
+// 否则被翻译 mod 的数据还没写入（dialogue 直写会错过、transformer 顺序也吃亏）。
+// PostSptModLoader 是 4.0 最后一档，再 +1 保证排在同档其他 mod 之后。
+[Injectable(TypePriority = OnLoadOrder.PostSptModLoader + 1)]
+public class SimpleTranslator(
+    ISptLogger<SimpleTranslator> logger,
+    ModHelper modHelper,
+    LocaleService localeService,
+    DatabaseServer databaseServer) : IOnLoad
+#else
+// 加载顺序：4.1 里所有 mod 默认都在 PostLoad 档执行，同档内按注册顺序排列。
+// 翻译 mod 必须最后执行，+1 保证排在 PostLoad 档所有 mod 之后，
+// 否则被翻译 mod 的数据还没写入（dialogue 直写会错过、transformer 顺序也吃亏）。
+[Injectable(TypePriority = OnLoadOrder.PostLoad + 1)]
 public class SimpleTranslator(
     ISptLogger<SimpleTranslator> logger,
     ModHelper modHelper,
     LocaleService localeService,
     LocaleTable localeTable,
     TemplateTable templateTable) : IOnLoad
+#endif
 {
-    // 预编译正则表达式以提高性能
-    private static readonly Regex JsonTrailingCommaRegex = new(@",\s*(\}|\])", RegexOptions.Compiled);
-    private static readonly Regex JsonBlockCommentRegex = new(@"/\*[\s\S]*?\*/", RegexOptions.Compiled);
-    private static readonly Regex JsonLineCommentRegex = new(@"^\s*//.*$", RegexOptions.Compiled | RegexOptions.Multiline);
+    // 目标语言（本 mod 只服务中文用户）
+    private static readonly string[] ServerLocales = { "ch" };
 
+    // devMode 文件监听器需要一直存活，用静态字段持有防止被 GC
+    private static FileSystemWatcher? _fileWatcher;
+
+#if SPT40
+    // 4.0 的 IOnLoad 是 OnLoad()，4.1 是 OnLoadAsync(CancellationToken)
+    public Task OnLoad()
+#else
     public Task OnLoadAsync(CancellationToken cancellationToken)
+#endif
     {
-        // 目标语言
-        var serverLocales = new[] { "ch" };
         var loadedFileCount = 0;
 
         var partiallyCoveredFiles = new List<(string fileName, int covered, int total)>();
@@ -53,7 +111,17 @@ public class SimpleTranslator(
         var addedLocalesCountByLang = new Dictionary<string, int>();
 
         var modPath = modHelper.GetAbsolutePathToModFolder(Assembly.GetExecutingAssembly());
-        foreach (var locale in serverLocales)
+
+        // 开发/日志模式：mod 目录下 config.jsonc 中 devMode=true 时，
+        // 加载完成后导出词条生效报告，并监听翻译文件变更给出重启提示
+        var config = ModConfig.Load(modPath, m => logger.Warning($"[文本汉化]{m}"));
+        var report = config.DevMode ? new TranslationReport() : null;
+        if (config.DevMode)
+        {
+            logger.Info("[文本汉化]开发模式已启用，加载完成后将导出词条生效报告");
+        }
+
+        foreach (var locale in ServerLocales)
         {
             var localePath = System.IO.Path.Combine(modPath, "db", "locales", locale);
             if (!Directory.Exists(localePath))
@@ -62,38 +130,138 @@ public class SimpleTranslator(
                 continue;
             }
 
+            if (config.DevMode)
+            {
+                StartFileWatcher(localePath, logger);
+            }
+
+            // 生效判定的参考字典：英文为主，目标语言现有字典兜底
+            // （有些键只存在于官方中文或其他 mod 已写入的中文里，单看 en 会误报未生效）
+            var referenceLocales = localeService.GetLocaleDb("en");
+            IReadOnlyDictionary<string, string>? targetLocaleRef = null;
+            try
+            {
+                targetLocaleRef = localeService.GetLocaleDb(locale);
+            }
+            catch
+            {
+                // 目标语言字典不可用时仅用 en 判定
+            }
+
+            // 跨文件键冲突追踪：键 -> 首次出现的文件（后者覆盖前者）
+            var keyFirstSeen = new Dictionary<string, string>();
+
             foreach (var file in Directory.EnumerateFiles(localePath, "*.*", SearchOption.AllDirectories)
                          .Where(f => new[] { ".json", ".jsonc" }.Contains(System.IO.Path.GetExtension(f).ToLowerInvariant()))
                          .Where(f => !f.Contains("\\dialogue\\") && !f.Contains("/dialogue/")))  // 排除 dialogue 目录
             {
                 loadedFileCount++;
 
-                var content = ParseFileContent(file, logger);
+                var content = Jsonc.ParseFile(file, m => logger.Error($"[文本汉化]{m}"));
                 if (content == null || content.Count == 0)
                 {
                     continue;
                 }
 
                 var totalFields = content.Count;
-                // 使用英文(en)字典作为参考来计算覆盖字段数
-                var referenceLocales = localeService.GetLocaleDb("en");
-                var coveredFields = content.Keys.Count(k => referenceLocales.ContainsKey(k));
+                var coveredFields = 0;
+                var relativeFile = System.IO.Path.GetRelativePath(localePath, file);
+                foreach (var kvp in content)
+                {
+                    // 键存在于英文或目标语言现有字典 = 覆盖了一条游戏原文 = 生效
+                    var covered = referenceLocales.ContainsKey(kvp.Key)
+                                  || (targetLocaleRef?.ContainsKey(kvp.Key) ?? false);
+                    if (covered)
+                    {
+                        coveredFields++;
+                    }
+                    report?.AddLocale(relativeFile, kvp.Key, kvp.Value, covered);
+
+                    if (keyFirstSeen.TryGetValue(kvp.Key, out var firstFile))
+                    {
+                        if (firstFile != relativeFile)
+                        {
+                            report?.AddConflict(kvp.Key, firstFile, relativeFile);
+                        }
+                    }
+                    else
+                    {
+                        keyFirstSeen[kvp.Key] = relativeFile;
+                    }
+                }
 
                 // 目标语言容器必须存在
-                if (!localeTable.Global.TryGetValue(locale, out var lazyTarget))
+#if SPT40
+                var localeGlobal = databaseServer.GetTables().Locales.Global;
+#else
+                var localeGlobal = localeTable.Global;
+#endif
+                if (!localeGlobal.TryGetValue(locale, out var lazyTarget))
                 {
                     logger.Warning($"目标语言 {locale} 在数据库中不存在，跳过该语言覆盖");
                     continue;
                 }
 
+                // 开发模式：用当前可见的字典预览占位符解析结果，失败项记入报告
+                // （最终以运行时 transformer 的警告日志为准，mod 物品的预览可能误报）
+                if (report != null)
+                {
+                    var preview = new Dictionary<string, string>(referenceLocales);
+                    if (targetLocaleRef != null)
+                    {
+                        foreach (var p in targetLocaleRef)
+                        {
+                            preview[p.Key] = p.Value;
+                        }
+                    }
+                    foreach (var p in content)
+                    {
+                        preview[p.Key] = p.Value;
+                    }
+                    foreach (var kvp in content)
+                    {
+                        var unresolved = new List<string>();
+                        ItemPlaceholders.Resolve(kvp.Value, preview, referenceLocales, unresolved);
+                        foreach (var id in unresolved)
+                        {
+                            report.AddUnresolvedPlaceholder(relativeFile, kvp.Key, id);
+                        }
+                    }
+                }
+
+                var fileName = System.IO.Path.GetFileName(file);
+
                 // 在目标语言上追加 transformer 以合并我们的更改（加入空字典保护）
                 lazyTarget.AddTransformer(targetDict =>
                 {
+#if SPT40
+                    // 4.0 的 Global 字典就是普通的 Dictionary<string, string>
+                    targetDict ??= new Dictionary<string, string>();
+#else
                     targetDict ??= new GlobalLocaleDictionary();
+#endif
 
+                    // 第一遍：先原样写入全部条目，保证第二遍解析占位符时
+                    // 能看到本文件自带的 "{id} Name" 等翻译条目
                     foreach (var kvp in content)
                     {
                         targetDict[kvp.Key] = kvp.Value;
+                    }
+
+                    // 第二遍：把 ${mongoId} 占位符替换为物品名称
+                    // transformer 在 locale 字典真正构建时才执行，此时其他 mod
+                    // 添加的物品名已进入字典，mod 物品也能正确解析
+                    foreach (var kvp in content)
+                    {
+                        var unresolved = kvp.Value.Contains("${") ? new List<string>() : null;
+                        targetDict[kvp.Key] = ItemPlaceholders.Resolve(kvp.Value, targetDict, referenceLocales, unresolved);
+                        if (unresolved != null)
+                        {
+                            foreach (var id in unresolved)
+                            {
+                                logger.Warning($"[文本汉化]占位符找不到物品名: {id}（{fileName} 的键 \"{kvp.Key}\"），游戏内将显示为裸 id");
+                            }
+                        }
                     }
                     return targetDict;
                 });
@@ -104,7 +272,6 @@ public class SimpleTranslator(
                 }
                 addedLocalesCountByLang[locale] += coveredFields;
 
-                var fileName = System.IO.Path.GetFileName(file);
                 if (coveredFields == 0)
                 {
                     nonCoveredFiles.Add(fileName);
@@ -120,135 +287,78 @@ public class SimpleTranslator(
             }
         }
 
-        LogStatistics(loadedFileCount, serverLocales, addedLocalesCountByLang, fullyCoveredFiles, partiallyCoveredFiles, nonCoveredFiles, logger);
+        LogStatistics(loadedFileCount, addedLocalesCountByLang, fullyCoveredFiles, partiallyCoveredFiles, nonCoveredFiles, logger);
 
         // 处理 dialogue 本地化
-        LoadDialogueLocalizations(modPath, serverLocales, logger);
+        LoadDialogueLocalizations(modPath, report);
+
+        // 开发模式：导出词条生效报告
+        report?.WriteTo(System.IO.Path.Combine(modPath, config.ReportFile), m => logger.Info(m), m => logger.Error(m));
 
         return Task.CompletedTask;
     }
 
     /// <summary>
-    /// 解析文件内容，支持 JSON 和 JSONC 格式
+    /// 开发模式：监听翻译目录的文件变更，提示译者修改需重启服务器生效。
+    /// （locale 字典构建后即固化，真正的热重载不可靠，故只做提示）
     /// </summary>
-    private static Dictionary<string, string>? ParseFileContent(string filePath, ISptLogger<SimpleTranslator> logger)
+    private static void StartFileWatcher(string localePath, ISptLogger<SimpleTranslator> logger)
     {
+        if (_fileWatcher != null)
+        {
+            return; // 已启动
+        }
+
         try
         {
-            var ext = System.IO.Path.GetExtension(filePath).ToLowerInvariant();
-            var raw = File.ReadAllText(filePath);
-
-            return ext switch
+            var watcher = new FileSystemWatcher(localePath)
             {
-                ".json" => JsonSerializer.Deserialize<Dictionary<string, string>>(raw),
-                ".jsonc" => ParseJsoncContent(raw),
-                _ => null
+                IncludeSubdirectories = true,
+                NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName,
+                EnableRaisingEvents = true
             };
+            var lastNotified = new Dictionary<string, DateTime>();
+
+            void OnChanged(object _, FileSystemEventArgs e)
+            {
+                var ext = System.IO.Path.GetExtension(e.FullPath).ToLowerInvariant();
+                if (ext is not (".json" or ".jsonc"))
+                {
+                    return;
+                }
+                // 去抖：编辑器一次保存常触发多个事件，500ms 内同一路径只提示一次
+                if (lastNotified.TryGetValue(e.FullPath, out var t) && (DateTime.Now - t).TotalMilliseconds < 500)
+                {
+                    return;
+                }
+                lastNotified[e.FullPath] = DateTime.Now;
+                logger.Info($"[文本汉化]检测到翻译文件变更: {e.FullPath} —— 重启服务器后生效");
+            }
+
+            watcher.Changed += OnChanged;
+            watcher.Created += OnChanged;
+            watcher.Deleted += OnChanged;
+            watcher.Renamed += OnChanged;
+
+            _fileWatcher = watcher;
         }
         catch (Exception ex)
         {
-            logger.Error($"[文本汉化]解析文件失败: {filePath}, 错误: {ex.Message}");
-            return null;
+            logger.Warning($"[文本汉化]翻译文件监听启动失败: {ex.Message}");
         }
     }
 
     /// <summary>
-    /// 安全地解析 JSONC 内容，先剥离注释再移除尾随逗号
+    /// 彩色日志包装：4.1 用 Spectre.Console.Color（前景+背景），
+    /// 4.0 用自带的 LogTextColor/LogBackgroundColor 枚举，调用处统一传 Color 前景色即可
     /// </summary>
-    private static Dictionary<string, string>? ParseJsoncContent(string rawContent)
+    private static void LogColored(ISptLogger<SimpleTranslator> logger, string message, Color color)
     {
-        var noComments = StripJsonComments(rawContent);
-        var normalized = JsonTrailingCommaRegex.Replace(noComments, "$1");
-        return JsonSerializer.Deserialize<Dictionary<string, string>>(normalized);
-    }
-
-    /// <summary>
-    /// 安全地剥离 JSON/JSONC 中的注释
-    /// 这个实现通过逐字符解析来避免正则表达式在复杂JSON结构中的问题
-    /// </summary>
-    private static string StripJsonComments(string input)
-    {
-        var result = new System.Text.StringBuilder();
-        var inString = false;
-        var inBlockComment = false;
-        var inLineComment = false;
-        var escapeNext = false;
-
-        for (int i = 0; i < input.Length; i++)
-        {
-            char current = input[i];
-            char next = i + 1 < input.Length ? input[i + 1] : '\0';
-
-            if (escapeNext)
-            {
-                result.Append(current);
-                escapeNext = false;
-                continue;
-            }
-
-            if (current == '\\' && inString)
-            {
-                result.Append(current);
-                escapeNext = true;
-                continue;
-            }
-
-            if (!inString && !inBlockComment && !inLineComment)
-            {
-                if (current == '/' && next == '/')
-                {
-                    inLineComment = true;
-                    i++; // 跳过下一个字符 '/'
-                    continue;
-                }
-                if (current == '/' && next == '*')
-                {
-                    inBlockComment = true;
-                    i++; // 跳过下一个字符 '*'
-                    continue;
-                }
-                if (current == '"')
-                {
-                    inString = true;
-                    result.Append(current);
-                    continue;
-                }
-            }
-            else if (inString)
-            {
-                if (current == '"')
-                {
-                    inString = false;
-                }
-                result.Append(current);
-                continue;
-            }
-            else if (inBlockComment)
-            {
-                if (current == '*' && next == '/')
-                {
-                    inBlockComment = false;
-                    i++; // 跳过下一个字符 '/'
-                    continue;
-                }
-                // 注释内容不添加到结果中
-                continue;
-            }
-            else if (inLineComment)
-            {
-                if (current == '\n' || current == '\r')
-                {
-                    inLineComment = false;
-                    result.Append(current); // 保留换行符以保持行号
-                }
-                // 注释内容不添加到结果中
-                continue;
-            }
-
-            result.Append(current);
-        }
-
-        return result.ToString();
+#if SPT40
+        logger.LogWithColor(message, color, LogBackgroundColor.Black);
+#else
+        logger.LogWithColor(message, color, Color.Black);
+#endif
     }
 
     /// <summary>
@@ -256,7 +366,6 @@ public class SimpleTranslator(
     /// </summary>
     private static void LogStatistics(
         int loadedFileCount,
-        string[] serverLocales,
         Dictionary<string, int> addedLocalesCountByLang,
         List<string> fullyCoveredFiles,
         List<(string fileName, int covered, int total)> partiallyCoveredFiles,
@@ -265,7 +374,7 @@ public class SimpleTranslator(
     {
         logger.Info($"[文本汉化]总计 [{loadedFileCount}] 个汉化文本文件加载");
 
-        foreach (var locale in serverLocales)
+        foreach (var locale in ServerLocales)
         {
             var count = addedLocalesCountByLang.TryGetValue(locale, out var c) ? c : 0;
             logger.Info($"[文本汉化]  - 总计: {count} 字段");
@@ -274,7 +383,7 @@ public class SimpleTranslator(
 
         if (fullyCoveredFiles.Count > 0)
         {
-            logger.LogWithColor($"[文本汉化]完全覆盖 文本列表:", Color.Green, Color.Black);
+            LogColored(logger, $"[文本汉化]完全覆盖 文本列表:", Color.Green);
             foreach (var f in fullyCoveredFiles)
             {
                 logger.Info($"  - {f} ");
@@ -284,7 +393,7 @@ public class SimpleTranslator(
 
         if (partiallyCoveredFiles.Count > 0)
         {
-            logger.LogWithColor($"[文本汉化]部分覆盖 文本列表:", Color.Yellow, Color.Black);
+            LogColored(logger, $"[文本汉化]部分覆盖 文本列表:", Color.Yellow);
             foreach (var f in partiallyCoveredFiles)
             {
                 logger.Info($"  - {f.fileName} ({f.covered}/{f.total} 字段)");
@@ -294,7 +403,7 @@ public class SimpleTranslator(
 
         if (nonCoveredFiles.Count > 0)
         {
-            logger.LogWithColor($"[文本汉化]未覆盖 文本列表:", Color.Red, Color.Black);
+            LogColored(logger, $"[文本汉化]未覆盖 文本列表:", Color.Red);
             foreach (var f in nonCoveredFiles)
             {
                 logger.Info($"  - {f}");
@@ -306,11 +415,11 @@ public class SimpleTranslator(
     /// <summary>
     /// 加载并应用 dialogue 本地化文本
     /// </summary>
-    private void LoadDialogueLocalizations(string modPath, string[] serverLocales, ISptLogger<SimpleTranslator> logger)
+    private void LoadDialogueLocalizations(string modPath, TranslationReport? report)
     {
         try
         {
-            foreach (var locale in serverLocales)
+            foreach (var locale in ServerLocales)
             {
                 var dialoguePath = System.IO.Path.Combine(modPath, "db", "locales", locale, "dialogue");
                 if (!Directory.Exists(dialoguePath))
@@ -322,87 +431,62 @@ public class SimpleTranslator(
                     .Where(f => new[] { ".json", ".jsonc" }.Contains(System.IO.Path.GetExtension(f).ToLowerInvariant()))
                     .ToList();
 
-                var updatedDialogueCount = 0;
-                var updatedTextCount = 0;
-
-                // 首先收集所有文件的内容
-                var dialogueLocalizations = new Dictionary<string, string>();
+                // 收集并合并所有文件的内容（后面的文件覆盖前面的），同时记录每个键的来源文件
+                var entries = new Dictionary<string, (string value, string file)>();
                 foreach (var file in dialogueFiles)
                 {
-                    var content = ParseFileContent(file, logger);
+                    var content = Jsonc.ParseFile(file, m => logger.Error($"[文本汉化]{m}"));
                     if (content == null || content.Count == 0)
                     {
                         continue;
                     }
 
-                    // 合并所有文件的文本（后面的文件会覆盖前面的）
+                    var relativeFile = System.IO.Path.GetRelativePath(dialoguePath, file);
                     foreach (var kvp in content)
                     {
-                        dialogueLocalizations[kvp.Key] = kvp.Value;
+                        if (entries.TryGetValue(kvp.Key, out var old) && old.file != relativeFile)
+                        {
+                            report?.AddConflict(kvp.Key, old.file, relativeFile);
+                        }
+                        entries[kvp.Key] = (kvp.Value, relativeFile);
                     }
                 }
 
-                if (dialogueLocalizations.Count == 0)
+                if (entries.Count == 0)
                 {
                     continue;
                 }
 
+#if SPT40
+                var dialogue = databaseServer.GetTables().Templates.Dialogue;
+#else
                 var dialogue = templateTable.Dialogue;
-                if (dialogue?.Elements == null)
+#endif
+
+                // 占位符解析用的字典引用：目标语言优先，英文兜底
+                // （dialogue 在 OnLoad 阶段直接写库，拿不到 transformer 合并后的最终字典，
+                //   个别 mod 物品名缺失时会自动回退英文或裸 id）
+                IReadOnlyDictionary<string, string>? targetLocaleRef = null;
+                IReadOnlyDictionary<string, string>? enLocaleRef = null;
+                try
                 {
-                    logger.Warning("[Dialogue本地化]无法获取 dialogue 数据");
-                    continue;
+                    targetLocaleRef = localeService.GetLocaleDb(locale);
+                    enLocaleRef = localeService.GetLocaleDb("en");
+                }
+                catch
+                {
+                    // 字典不可用时跳过占位符解析，不影响文本写入
                 }
 
-                // 遍历所有 dialogue elements，只更新目标语言的文本
-                foreach (var element in dialogue.Elements)
-                {
-                    if (element.LocalizationDictionary == null)
-                    {
-                        element.LocalizationDictionary = new Dictionary<string, Dictionary<string, string>>();
-                    }
-
-                    if (!element.LocalizationDictionary.TryGetValue(locale, out var localeDict))
-                    {
-                        localeDict = new Dictionary<string, string>();
-                        element.LocalizationDictionary[locale] = localeDict;
-                    }
-
-                    var textsUpdated = 0;
-
-                    // 只更新匹配的文本ID（如果 element 的 localization 中有这些文本ID）
-                    foreach (var kvp in dialogueLocalizations)
-                    {
-                        // 检查当前 element 的 localization 中是否存在这个文本ID（任意语言都可以）
-                        bool textExists = false;
-                        foreach (var existingLocale in element.LocalizationDictionary.Keys)
-                        {
-                            if (element.LocalizationDictionary[existingLocale].ContainsKey(kvp.Key))
-                            {
-                                textExists = true;
-                                break;
-                            }
-                        }
-
-                        // 如果文本ID存在于任意语言的 localization 中，则更新目标语言的翻译
-                        if (textExists)
-                        {
-                            localeDict[kvp.Key] = kvp.Value;
-                            textsUpdated++;
-                        }
-                    }
-
-                    if (textsUpdated > 0)
-                    {
-                        updatedDialogueCount++;
-                        updatedTextCount += textsUpdated;
-                    }
-                }
-
-                if (updatedDialogueCount > 0)
-                {
-                    logger.Info($"[Dialogue本地化] {locale}: 更新了 {updatedDialogueCount} 个对话元素，共 {updatedTextCount} 条文本");
-                }
+                DialogueLocalizer.Apply(
+                    dialogue,
+                    locale,
+                    entries,
+                    targetLocaleRef,
+                    enLocaleRef,
+                    report,
+                    m => logger.Info(m),
+                    m => logger.Warning(m));
             }
         }
         catch (Exception ex)

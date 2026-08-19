@@ -1,13 +1,21 @@
 # Build outputs
 bin/
 obj/
-dist/
+# 所有发布产物目录：dist / dist-debug / dist-4.0 / dist-4.0-debug
+dist*/
 
 # IDE settings
 .vs/
 .vscode/
 *.user
 *.suo
+
+# Test results
+TestResults/
+*.trx
+
+# 开发模式生成的词条生效报告（运行在部署目录，防止误放仓库根目录时被提交）
+translation-report.jsonc
 
 # Logs and cache
 *.log
@@ -21,6 +29,11 @@ ehthumbs.db
 # Temporary files
 *.tmp
 *.temp
+example
+
+# 本地参考程序集（4.0 依赖已改用 NuGet 包，tref 仅存档，不进仓库）
+tref/
+4.1ref/
 
 # NuGet
 **/packages/
@@ -30,4 +43,3 @@ ehthumbs.db
 *.zip
 server-mod-examples/
 server-csharp/
-example

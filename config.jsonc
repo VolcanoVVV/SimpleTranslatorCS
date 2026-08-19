@@ -1,0 +1,15 @@
+{
+ /*
+ ** [SimpleTranslatorCS 设置]
+ ** devMode    开发/日志模式：true 时，服务器启动加载完所有翻译后，
+ **            会把每条词条按 [生效] / [未生效] 导出成报告 jsonc，
+ **            用于排查哪些键写错了或对应 mod 没装。
+ ** reportFile 报告输出文件名（相对 mod 目录），默认 translation-report.jsonc
+ **
+ ** 生效判定：普通本地化 = 键在英文参考库中存在（覆盖到了游戏原文）；
+ **           dialogue = 键匹配到了至少一个对话元素。
+ ** [未生效] 的词条不会显示在游戏里，请检查键名拼写或对应 mod 是否安装。
+ */
+    "devMode": false,
+    "reportFile": "translation-report.jsonc"
+}

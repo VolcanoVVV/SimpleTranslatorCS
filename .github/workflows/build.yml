@@ -1,0 +1,45 @@
+name: build
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Run tests
+        run: dotnet test tests/SimpleTranslatorCS.Tests/SimpleTranslatorCS.Tests.csproj -c Release
+
+      # 四个配置分别对应：SPT 4.1/4.0 × Debug/Release
+      # 注意不要用 --no-restore：不同 SptTarget 的 NuGet 引用不同，每个构建需各自还原
+      - name: Build 4.1 Release
+        run: dotnet build SimpleTranslatorCS.csproj -c "4.1 Release"
+
+      - name: Build 4.1 Debug
+        run: dotnet build SimpleTranslatorCS.csproj -c "4.1 Debug"
+
+      - name: Build 4.0 Release
+        run: dotnet build SimpleTranslatorCS.csproj -c "4.0 Release"
+
+      - name: Build 4.0 Debug
+        run: dotnet build SimpleTranslatorCS.csproj -c "4.0 Debug"
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-packages
+          path: |
+            dist/
+            dist-debug/
+            dist-4.0/
+            dist-4.0-debug/
+          if-no-files-found: ignore

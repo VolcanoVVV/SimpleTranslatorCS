@@ -1,27 +1,85 @@
 <Project Sdk="Microsoft.NET.Sdk.Web">
 
+  <!--
+    双版本构建（SptTarget 推导规则与中间目录隔离见 Directory.Build.props）：
+      dotnet build                       -> 面向 SPT 4.1.x（Debug），产物进 dist-debug/
+      dotnet build -c Release            -> 面向 SPT 4.1.x，产物进 dist/
+      dotnet build -c "4.0 Release"      -> 面向 SPT 4.0.x，产物进 dist-4.0/
+      dotnet build -c "4.1 Debug"        -> 面向 SPT 4.1.x，产物进 dist-debug/
+    VS 配置管理器里选 4.0/4.1 × Debug/Release 四档即可，效果同上。
+    4.1 依赖来自 NuGet 包，4.0 依赖来自 tref/ 下的本地 dll。
+  -->
   <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
     <RootNamespace>SimpleTranslatorCS</RootNamespace>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <OutputType>Library</OutputType>
-    <Version>1.2.0</Version>
-    <OutputPath>bin\$(Configuration)\$(ProjectName)\$(AssemblyName)\</OutputPath>
+    <Version>1.4.0</Version>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <OutputPath>bin\$(Configuration)\$(SptTarget)\$(AssemblyName)\</OutputPath>
+    <!-- 告诉 VS 配置管理器本项目支持的全部配置名 -->
+    <Configurations>Debug;Release;4.0 Debug;4.0 Release;4.1 Debug;4.1 Release</Configurations>
+    <!-- 自定义配置名会被 SDK 自动转成一个 /define 常量，"4.0 Release" 转出的 4_0_RELEASE
+         不是合法标识符而产生 MSB3052 警告，该常量无用，降级为消息屏蔽 -->
+    <MSBuildWarningsAsMessages>$(MSBuildWarningsAsMessages);MSB3052</MSBuildWarningsAsMessages>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="fastJSON5" Version="1.0.4" />
+    <!-- 允许测试项目访问 internal 的纯逻辑类（Jsonc / ItemPlaceholders / ModConfig / TranslationReport） -->
+    <InternalsVisibleTo Include="SimpleTranslatorCS.Tests" />
+  </ItemGroup>
+
+  <!-- 自定义配置名（4.0 Debug 等）不会自动继承 Debug/Release 的编译语义，按名字补齐：
+       Debug = 不优化 + 完整调试符号 + 定义 DEBUG/TRACE，用于排错；
+       Release = 开优化 + 定义 TRACE，用于发布。 -->
+  <PropertyGroup Condition="$([System.String]::Copy('$(Configuration)').StartsWith('4.')) and $([System.String]::Copy('$(Configuration)').EndsWith('Debug'))">
+    <DefineConstants>$(DefineConstants);DEBUG;TRACE</DefineConstants>
+    <Optimize>false</Optimize>
+    <DebugSymbols>true</DebugSymbols>
+    <DebugType>full</DebugType>
+  </PropertyGroup>
+  <PropertyGroup Condition="$([System.String]::Copy('$(Configuration)').StartsWith('4.')) and $([System.String]::Copy('$(Configuration)').EndsWith('Release'))">
+    <DefineConstants>$(DefineConstants);TRACE</DefineConstants>
+    <Optimize>true</Optimize>
+  </PropertyGroup>
+
+  <!-- Debug 配置的发布目录加 -debug 后缀，防止调试版 dll 覆盖发布版 -->
+  <PropertyGroup Condition="$([System.String]::Copy('$(Configuration)').EndsWith('Debug'))">
+    <DistDirSuffix>-debug</DistDirSuffix>
+  </PropertyGroup>
+
+  <!-- TargetFramework 必须随服务器运行时切换：SPT 4.1 跑 net10，SPT 4.0 跑 net9。
+       用 net10 编出的 dll 放进 4.0 服务器会报 System.Runtime, Version=10.0.0.0 找不到 -->
+  <PropertyGroup Condition="'$(SptTarget)' == '4.0'">
+    <TargetFramework>net9.0</TargetFramework>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(SptTarget)' != '4.0'">
+    <TargetFramework>net10.0</TargetFramework>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(SptTarget)' == '4.0'">
+    <DefineConstants>$(DefineConstants);SPT40</DefineConstants>
+    <DistDir>$(MSBuildProjectDirectory)\dist-4.0$(DistDirSuffix)</DistDir>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(SptTarget)' != '4.0'">
+    <DistDir>$(MSBuildProjectDirectory)\dist$(DistDirSuffix)</DistDir>
+  </PropertyGroup>
+
+  <!-- SPT 4.0.x：NuGet 包（4.0.9 为 4.0 线最新补丁版；所用 API 已在 4.0.0 验证存在，
+       程序集非强命名，运行时按服务器自带版本加载） -->
+  <ItemGroup Condition="'$(SptTarget)' == '4.0'">
+    <PackageReference Include="SPTarkov.Common" Version="4.0.9" />
+    <PackageReference Include="SPTarkov.DI" Version="4.0.9" />
+    <PackageReference Include="SPTarkov.Server.Core" Version="4.0.9" />
+  </ItemGroup>
+
+  <!-- SPT 4.1.x：引用 NuGet 包 -->
+  <ItemGroup Condition="'$(SptTarget)' != '4.0'">
     <PackageReference Include="SPTarkov.Common" Version="4.1.2" />
     <PackageReference Include="SPTarkov.DI" Version="4.1.2" />
     <PackageReference Include="SPTarkov.Server.Core" Version="4.1.2" />
   </ItemGroup>
-
-  <PropertyGroup>
-    <DistDir>$(MSBuildProjectDirectory)\dist</DistDir>
-  </PropertyGroup>
 
   <ItemGroup>
     <ChFiles Include="$(MSBuildProjectDirectory)\db\locales\ch\**\*.*" />
@@ -30,15 +88,19 @@
   <Target Name="CopyToDist" AfterTargets="Build">
     <MakeDir Directories="$(DistDir)\db\locales\ch" />
     <Copy SourceFiles="$(TargetDir)SimpleTranslatorCS.dll" DestinationFolder="$(DistDir)" />
-    <Copy SourceFiles="$(TargetDir)fastJSON5.dll" DestinationFolder="$(DistDir)" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\config.jsonc" DestinationFolder="$(DistDir)" Condition="Exists('$(MSBuildProjectDirectory)\config.jsonc')" />
     <Copy SourceFiles="@(ChFiles)" DestinationFiles="@(ChFiles->'$(DistDir)\db\locales\ch\%(RecursiveDir)%(Filename)%(Extension)')" />
   </Target>
   <ItemGroup>
     <Compile Remove="server-mod-examples\**\*.cs" />
     <Compile Remove="server-csharp\**\*.cs" />
+    <Compile Remove="tests\**\*.cs" />
+    <!-- 防止另一个构建目标（obj\4.0 / obj\4.1）生成的 cs 文件泄漏进当前编译 -->
+    <Compile Remove="obj\**\*.cs" />
   </ItemGroup>
   <ItemGroup>
     <Content Remove="server-csharp\**\*" />
     <Content Remove="server-mod-examples\**\*" />
+    <Content Remove="tests\**\*" />
   </ItemGroup>
 </Project>
