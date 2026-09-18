@@ -148,12 +148,13 @@ public class SimpleTranslator(
                 // 目标语言字典不可用时仅用 en 判定
             }
 
-            // 跨文件键冲突追踪：键 -> 首次出现的文件（后者覆盖前者）
-            var keyFirstSeen = new Dictionary<string, string>();
+            // 跨文件键冲突追踪：键 -> 首次出现的文件（后者覆盖前者）。
+            // 比较器与目标容器一致（4.1 GlobalLocaleDictionary 为 OrdinalIgnoreCase），
+            // 否则仅大小写不同的键实际互相覆盖、报告里却被当成不同键
+            var keyFirstSeen = new Dictionary<string, string>(TranslationFiles.KeyComparer);
 
-            foreach (var file in Directory.EnumerateFiles(localePath, "*.*", SearchOption.AllDirectories)
-                         .Where(f => new[] { ".json", ".jsonc" }.Contains(System.IO.Path.GetExtension(f).ToLowerInvariant()))
-                         .Where(f => !f.Contains("\\dialogue\\") && !f.Contains("/dialogue/")))  // 排除 dialogue 目录
+            // 稳定加载顺序：按相对路径 Ordinal 排序，后文件覆盖前文件的结果跨机器一致
+            foreach (var file in TranslationFiles.EnumerateLocaleFiles(localePath))
             {
                 loadedFileCount++;
 
@@ -427,12 +428,11 @@ public class SimpleTranslator(
                     continue;
                 }
 
-                var dialogueFiles = Directory.EnumerateFiles(dialoguePath, "*.json*", SearchOption.AllDirectories)
-                    .Where(f => new[] { ".json", ".jsonc" }.Contains(System.IO.Path.GetExtension(f).ToLowerInvariant()))
-                    .ToList();
+                var dialogueFiles = TranslationFiles.EnumerateDialogueFiles(dialoguePath);
 
-                // 收集并合并所有文件的内容（后面的文件覆盖前面的），同时记录每个键的来源文件
-                var entries = new Dictionary<string, (string value, string file)>();
+                // 收集并合并所有文件的内容（后面的文件覆盖前面的），同时记录每个键的来源文件。
+                // 比较器与目标容器一致，仅大小写不同的键也会按同一键合并并报冲突
+                var entries = new Dictionary<string, (string value, string file)>(TranslationFiles.KeyComparer);
                 foreach (var file in dialogueFiles)
                 {
                     var content = Jsonc.ParseFile(file, m => logger.Error($"[文本汉化]{m}"));
