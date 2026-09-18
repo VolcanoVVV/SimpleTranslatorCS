@@ -1,23 +1,28 @@
 using System.Text;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 
 namespace SimpleTranslatorCS;
 
 /// <summary>
-/// JSON/JSONC 解析工具：剥离注释、去尾随逗号、读文件（含编码检测）、
-/// 解析为键值字典（含同文件重复键检测）。
+/// JSON/JSONC 解析工具：读文件（含编码检测）、解析为键值字典（含同文件重复键检测）。
+/// 解析统一走 System.Text.Json 原生选项（跳过注释、允许尾随逗号），
+/// 解析器自身区分字符串内外，不会像旧正则实现那样误删字符串值里的 ,} / ,]。
 /// 不依赖任何 SPT 类型，日志通过回调外抛，便于单元测试。
 /// </summary>
 internal static class Jsonc
 {
-    // 预编译正则：匹配对象/数组收尾前的尾随逗号
-    private static readonly Regex TrailingCommaRegex = new(@",\s*(\}|\])", RegexOptions.Compiled);
+    // 原生 JSONC 解析选项：.json 与 .jsonc 两个扩展名共用同一套，行为一致
+    private static readonly JsonDocumentOptions s_parseOptions = new()
+    {
+        CommentHandling = JsonCommentHandling.Skip,
+        AllowTrailingCommas = true
+    };
 
     /// <summary>
     /// 安全地剥离 JSON/JSONC 中的注释（// 行注释与 /* */ 块注释）。
     /// 通过逐字符状态机实现，避免正则把字符串字面量里的 // 或 /* 误判为注释；
     /// 换行符会保留以保持行号。
+    /// 注：生产解析已改用原生选项（CommentHandling.Skip），本方法保留供测试与诊断使用。
     /// </summary>
     public static string StripComments(string input)
     {
@@ -105,12 +110,13 @@ internal static class Jsonc
     }
 
     /// <summary>
-    /// 规范化 JSONC 文本：先剥离注释，再移除尾随逗号，输出严格 JSON。
+    /// 规范化 JSONC 文本：用原生选项（跳过注释、允许尾随逗号）解析后重写为严格 JSON。
+    /// 输出为压缩格式，仅供再次解析使用；字符串值内的 ,} / ,] 不受影响。
     /// </summary>
     public static string Normalize(string rawContent)
     {
-        var noComments = StripComments(rawContent);
-        return TrailingCommaRegex.Replace(noComments, "$1");
+        using var doc = JsonDocument.Parse(rawContent, s_parseOptions);
+        return JsonSerializer.Serialize(doc.RootElement);
     }
 
     /// <summary>
@@ -129,20 +135,17 @@ internal static class Jsonc
     }
 
     /// <summary>
-    /// 解析 .json/.jsonc 文件为键值字典。
+    /// 解析 .json/.jsonc 文件为键值字典（两个扩展名走同一套原生选项，行为一致）。
     /// - 同文件内重复键：保留最后一条（与 System.Text.Json 行为一致），并逐键 warn 提示；
     /// - 非字符串值：跳过并 warn 提示；
-    /// - 解析失败：warn 提示并返回 null。
+    /// - 解析失败：warn 提示（含 JsonException 的行号/行内字节位置）并返回 null。
     /// </summary>
     public static Dictionary<string, string>? ParseFile(string path, Action<string>? warn)
     {
         try
         {
-            var ext = Path.GetExtension(path).ToLowerInvariant();
             var raw = ReadFileText(path, warn);
-            var json = ext == ".jsonc" ? Normalize(raw) : raw;
-
-            using var doc = JsonDocument.Parse(json);
+            using var doc = JsonDocument.Parse(raw, s_parseOptions);
             if (doc.RootElement.ValueKind != JsonValueKind.Object)
             {
                 warn?.Invoke($"翻译文件顶层必须是对象 {{ }}: {path}");
@@ -164,6 +167,15 @@ internal static class Jsonc
                 result[prop.Name] = prop.Value.GetString()!;
             }
             return result;
+        }
+        catch (JsonException ex)
+        {
+            // JsonException 自带 0 起始的行号/行内字节位置，转为编辑器习惯的 1 起始行号便于定位
+            var location = ex.LineNumber is long line
+                ? $"（行号: {line + 1}, 行内字节位置: {ex.BytePositionInLine}）"
+                : "";
+            warn?.Invoke($"解析文件失败: {path}, 错误: {ex.Message}{location}");
+            return null;
         }
         catch (Exception ex)
         {
