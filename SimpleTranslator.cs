@@ -148,12 +148,8 @@ public class SimpleTranslator(
                 // 目标语言字典不可用时仅用 en 判定
             }
 
-            // 跨文件键冲突追踪：键 -> 首次出现的文件（后者覆盖前者）。
-            // 比较器与目标容器一致（4.1 GlobalLocaleDictionary 为 OrdinalIgnoreCase），
-            // 否则仅大小写不同的键实际互相覆盖、报告里却被当成不同键
-            var keyFirstSeen = new Dictionary<string, string>(TranslationFiles.KeyComparer);
-
-            // 稳定加载顺序：按相对路径 Ordinal 排序，后文件覆盖前文件的结果跨机器一致
+            // 枚举 + 解析全部有效翻译文件（稳定排序即优先级：同键后文件覆盖前文件）
+            var parsedFiles = new List<(string File, IReadOnlyDictionary<string, string> Entries)>();
             foreach (var file in TranslationFiles.EnumerateLocaleFiles(localePath))
             {
                 loadedFileCount++;
@@ -163,10 +159,25 @@ public class SimpleTranslator(
                 {
                     continue;
                 }
+                parsedFiles.Add((System.IO.Path.GetRelativePath(localePath, file), content));
+            }
 
+            // 全量合并（含每个键的覆盖链 provenance，供冲突报告与占位符归属使用）
+            var merged = TranslationMerger.Merge(parsedFiles);
+
+            // 目标语言容器必须存在。不存在时保持旧语义：词条仍记入报告，但不计入统计、不注册 transformer
+#if SPT40
+            var localeGlobal = databaseServer.GetTables().Locales.Global;
+#else
+            var localeGlobal = localeTable.Global;
+#endif
+            var targetAvailable = localeGlobal.ContainsKey(locale);
+
+            // 逐文件统计 covered/total 并写入报告（语义不变；T4 统一修正"生效"判定）
+            foreach (var (relativeFile, content) in parsedFiles)
+            {
                 var totalFields = content.Count;
                 var coveredFields = 0;
-                var relativeFile = System.IO.Path.GetRelativePath(localePath, file);
                 foreach (var kvp in content)
                 {
                     // 键存在于英文或目标语言现有字典 = 覆盖了一条游戏原文 = 生效
@@ -177,95 +188,12 @@ public class SimpleTranslator(
                         coveredFields++;
                     }
                     report?.AddLocale(relativeFile, kvp.Key, kvp.Value, covered);
-
-                    if (keyFirstSeen.TryGetValue(kvp.Key, out var firstFile))
-                    {
-                        if (firstFile != relativeFile)
-                        {
-                            report?.AddConflict(kvp.Key, firstFile, relativeFile);
-                        }
-                    }
-                    else
-                    {
-                        keyFirstSeen[kvp.Key] = relativeFile;
-                    }
                 }
 
-                // 目标语言容器必须存在
-#if SPT40
-                var localeGlobal = databaseServer.GetTables().Locales.Global;
-#else
-                var localeGlobal = localeTable.Global;
-#endif
-                if (!localeGlobal.TryGetValue(locale, out var lazyTarget))
+                if (!targetAvailable)
                 {
-                    logger.Warning($"目标语言 {locale} 在数据库中不存在，跳过该语言覆盖");
                     continue;
                 }
-
-                // 开发模式：用当前可见的字典预览占位符解析结果，失败项记入报告
-                // （最终以运行时 transformer 的警告日志为准，mod 物品的预览可能误报）
-                if (report != null)
-                {
-                    var preview = new Dictionary<string, string>(referenceLocales);
-                    if (targetLocaleRef != null)
-                    {
-                        foreach (var p in targetLocaleRef)
-                        {
-                            preview[p.Key] = p.Value;
-                        }
-                    }
-                    foreach (var p in content)
-                    {
-                        preview[p.Key] = p.Value;
-                    }
-                    foreach (var kvp in content)
-                    {
-                        var unresolved = new List<string>();
-                        ItemPlaceholders.Resolve(kvp.Value, preview, referenceLocales, unresolved);
-                        foreach (var id in unresolved)
-                        {
-                            report.AddUnresolvedPlaceholder(relativeFile, kvp.Key, id);
-                        }
-                    }
-                }
-
-                var fileName = System.IO.Path.GetFileName(file);
-
-                // 在目标语言上追加 transformer 以合并我们的更改（加入空字典保护）
-                lazyTarget.AddTransformer(targetDict =>
-                {
-#if SPT40
-                    // 4.0 的 Global 字典就是普通的 Dictionary<string, string>
-                    targetDict ??= new Dictionary<string, string>();
-#else
-                    targetDict ??= new GlobalLocaleDictionary();
-#endif
-
-                    // 第一遍：先原样写入全部条目，保证第二遍解析占位符时
-                    // 能看到本文件自带的 "{id} Name" 等翻译条目
-                    foreach (var kvp in content)
-                    {
-                        targetDict[kvp.Key] = kvp.Value;
-                    }
-
-                    // 第二遍：把 ${mongoId} 占位符替换为物品名称
-                    // transformer 在 locale 字典真正构建时才执行，此时其他 mod
-                    // 添加的物品名已进入字典，mod 物品也能正确解析
-                    foreach (var kvp in content)
-                    {
-                        var unresolved = kvp.Value.Contains("${") ? new List<string>() : null;
-                        targetDict[kvp.Key] = ItemPlaceholders.Resolve(kvp.Value, targetDict, referenceLocales, unresolved);
-                        if (unresolved != null)
-                        {
-                            foreach (var id in unresolved)
-                            {
-                                logger.Warning($"[文本汉化]占位符找不到物品名: {id}（{fileName} 的键 \"{kvp.Key}\"），游戏内将显示为裸 id");
-                            }
-                        }
-                    }
-                    return targetDict;
-                });
 
                 if (!addedLocalesCountByLang.ContainsKey(locale))
                 {
@@ -273,6 +201,7 @@ public class SimpleTranslator(
                 }
                 addedLocalesCountByLang[locale] += coveredFields;
 
+                var fileName = System.IO.Path.GetFileName(relativeFile);
                 if (coveredFields == 0)
                 {
                     nonCoveredFiles.Add(fileName);
@@ -286,6 +215,90 @@ public class SimpleTranslator(
                     fullyCoveredFiles.Add(fileName);
                 }
             }
+
+            // 冲突报告：覆盖链上每一对相邻覆盖记一条（后者覆盖前者）
+            foreach (var (key, chain) in merged.OverrideChains)
+            {
+                for (var i = 1; i < chain.Count; i++)
+                {
+                    report?.AddConflict(key, chain[i - 1], chain[i]);
+                }
+            }
+
+            if (merged.Values.Count == 0)
+            {
+                continue;
+            }
+
+            if (!targetAvailable)
+            {
+                logger.Warning($"目标语言 {locale} 在数据库中不存在，跳过该语言覆盖");
+                continue;
+            }
+            var lazyTarget = localeGlobal[locale];
+
+            // 开发模式：基于合并后的完整字典预览占位符解析结果（跨文件引用可见，比逐文件预览更准），
+            // 缺失归属到该键的胜出文件；最终以运行时 transformer 的警告日志为准，mod 物品的预览可能误报
+            if (report != null)
+            {
+                var preview = new Dictionary<string, string>(referenceLocales);
+                if (targetLocaleRef != null)
+                {
+                    foreach (var p in targetLocaleRef)
+                    {
+                        preview[p.Key] = p.Value;
+                    }
+                }
+                foreach (var p in merged.Values)
+                {
+                    preview[p.Key] = p.Value;
+                }
+                foreach (var kvp in merged.Values)
+                {
+                    var unresolved = new List<string>();
+                    ItemPlaceholders.Resolve(kvp.Value, preview, referenceLocales, unresolved);
+                    foreach (var id in unresolved)
+                    {
+                        report.AddUnresolvedPlaceholder(merged.WinningFile(kvp.Key)!, kvp.Key, id);
+                    }
+                }
+            }
+
+            // 每语言只注册一个 transformer。
+            // transformer 在 locale 字典真正构建时才执行，此时其他 mod
+            // 添加的物品名已进入字典，mod 物品也能正确解析
+            lazyTarget.AddTransformer(targetDict =>
+            {
+#if SPT40
+                // 4.0 的 Global 字典就是普通的 Dictionary<string, string>
+                targetDict ??= new Dictionary<string, string>();
+#else
+                targetDict ??= new GlobalLocaleDictionary();
+#endif
+
+                // 先原样写入全部合并值：随后解析占位符时目标字典已含全部合并原始值
+                // 与游戏/其他 mod 条目，跨文件引用因此可见
+                foreach (var kvp in merged.Values)
+                {
+                    targetDict[kvp.Key] = kvp.Value;
+                }
+
+                // 再统一对合并后的每个键做深度占位符解析
+                // （同一键的同一缺失 id 只警告一次，归属到胜出文件）
+                foreach (var kvp in merged.Values)
+                {
+                    var unresolved = kvp.Value.Contains("${") ? new List<string>() : null;
+                    targetDict[kvp.Key] = ItemPlaceholders.Resolve(kvp.Value, targetDict, referenceLocales, unresolved);
+                    if (unresolved != null)
+                    {
+                        foreach (var id in unresolved)
+                        {
+                            logger.Warning($"[文本汉化]占位符找不到物品名: {id}（{merged.WinningFile(kvp.Key)} 的键 \"{kvp.Key}\"），游戏内将显示为裸 id");
+                        }
+                    }
+                }
+                return targetDict;
+            });
         }
 
         LogStatistics(loadedFileCount, addedLocalesCountByLang, fullyCoveredFiles, partiallyCoveredFiles, nonCoveredFiles, logger);

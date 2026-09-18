@@ -80,4 +80,91 @@ public class ItemPlaceholdersTests
         Assert.AreEqual(Id, result);
         Assert.AreEqual(1, unresolved.Count);
     }
+
+    private const string IdA = "aaaaaaaaaaaaaaaaaaaaaaaa";
+    private const string IdB = "bbbbbbbbbbbbbbbbbbbbbbbb";
+    private const string MissingId = "cccccccccccccccccccccccc";
+
+    [TestMethod]
+    public void Resolve_NestedPlaceholders_ResolveRecursively()
+    {
+        // 物品名本身仍含占位符：递归解析到底
+        var dict = new Dictionary<string, string>
+        {
+            [IdA + " Name"] = $"碎片（材料：${{{IdB}}}）",
+            [IdB + " Name"] = "古代螺栓",
+        };
+
+        var result = ItemPlaceholders.Resolve($"上交 ${{{IdA}}}", dict, En);
+
+        Assert.AreEqual("上交 碎片（材料：古代螺栓）", result);
+    }
+
+    [TestMethod]
+    public void Resolve_ChainThroughAnotherEntry_ReachesItemName()
+    {
+        // 链：文本 -> 引用翻译条目 -> 条目再引用物品名
+        var dict = new Dictionary<string, string>
+        {
+            [IdA + " Name"] = $"关于 ${{{IdB}}} 的记录",
+            [IdB + " Name"] = "古代螺栓",
+        };
+
+        var result = ItemPlaceholders.Resolve($"阅读 ${{{IdA}}}", dict, null);
+
+        Assert.AreEqual("阅读 关于 古代螺栓 的记录", result);
+    }
+
+    [TestMethod]
+    public void Resolve_NestedIdOnlyInFallback_ResolvesThroughFallback()
+    {
+        // primary 只有外层名字，内层 id 需要回退到 fallback 查找
+        var dict = new Dictionary<string, string>
+        {
+            [IdA + " Name"] = $"英名 ${{{IdB}}}",
+        };
+        var fallback = new Dictionary<string, string>
+        {
+            [IdB + " Name"] = "Bolt",
+        };
+
+        var result = ItemPlaceholders.Resolve($"${{{IdA}}}", dict, fallback);
+
+        Assert.AreEqual("英名 Bolt", result);
+    }
+
+    [TestMethod]
+    public void Resolve_CircularReference_StopsAtMaxDepthWithoutThrowing()
+    {
+        // A 的名字引用 B、B 的名字引用 A：必须在深度上限处停止，不死循环、不栈溢出
+        var dict = new Dictionary<string, string>
+        {
+            [IdA + " Name"] = $"${{{IdB}}}",
+            [IdB + " Name"] = $"${{{IdA}}}",
+        };
+        var unresolved = new List<string>();
+
+        var result = ItemPlaceholders.Resolve($"${{{IdA}}}", dict, null, unresolved);
+
+        // 超限后保留未解析的内层占位符，缺失 id 去重后记为未解析
+        StringAssert.Contains(result, "${");
+        Assert.AreEqual(1, unresolved.Count);
+    }
+
+    [TestMethod]
+    public void Resolve_SameMissingIdRepeatedAndNested_ReportedOnlyOnce()
+    {
+        // 同一键里同一个缺失 id 直接出现一次、又经递归出现一次：只报告一次
+        var dict = new Dictionary<string, string>
+        {
+            [IdA + " Name"] = $"${{{MissingId}}}碎片",
+        };
+        var unresolved = new List<string>();
+
+        var result = ItemPlaceholders.Resolve($"${{{MissingId}}} 和 ${{{IdA}}}", dict, null, unresolved);
+
+        Assert.AreEqual(1, unresolved.Count);
+        Assert.AreEqual(MissingId, unresolved[0]);
+        StringAssert.Contains(result, MissingId);
+    }
 }

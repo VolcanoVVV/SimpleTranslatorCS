@@ -142,15 +142,17 @@ Mod 根目录下的 `config.jsonc` 提供开发/日志模式，默认关闭：
 | --- | --- |
 | `SimpleTranslator.cs` | ModMetadata、主加载流程、统计日志、文件监听 |
 | `Jsonc.cs` | JSONC 注释剥离 / 尾随逗号 / 文件解析（重复键、编码检测） |
-| `ItemPlaceholders.cs` | `${mongoId}` 占位符解析 |
+| `TranslationFiles.cs` | 翻译文件稳定枚举 + 键比较器 |
+| `TranslationMerger.cs` | 多文件词条全量合并（排序即优先级）+ 覆盖链 provenance |
+| `ItemPlaceholders.cs` | `${mongoId}` 占位符解析（深度递归 + 循环防护） |
 | `DialogueLocalizer.cs` | dialogue 词条写入（键并集预过滤优化） |
 | `ModConfig.cs` | `config.jsonc` 加载 |
 | `TranslationReport.cs` | 开发模式报告（生效状态 / 键冲突 / 占位符失败） |
 
-- 普通本地化的写入通过 `localeTable.Global["ch"].AddTransformer` 延迟合并：第一遍写入全部条目，第二遍解析占位符，因此翻译文件自带的 `"{id} Name"` 条目也能被同文件内的占位符引用。
+- 普通本地化先把全部有效文件合并为一个字典（同键后文件覆盖前文件），每种语言只注册一个 `AddTransformer`：先写入全部合并原始值，再统一做深度占位符解析，跨文件引用（A 文件的文本引用 B 文件提供的物品名）也能正确解析。
 - dialogue 文本在 `OnLoad` 阶段直接写入对话数据表，占位符解析使用 `LocaleService.GetLocaleDb` 的当前字典（ch 优先、en 兜底）。
 - 版本号单一来源是 csproj 的 `<Version>`，`ModMetadata` 从程序集元数据读回，发版只需改 csproj。
-- 测试：`dotnet test tests/SimpleTranslatorCS.Tests`（MSTest，覆盖 Jsonc / ItemPlaceholders / ModConfig / TranslationReport）。
+- 测试：`dotnet test tests/SimpleTranslatorCS.Tests`（MSTest，覆盖 Jsonc / ItemPlaceholders / ModConfig / TranslationReport / TranslationFiles / TranslationMerger）。
 - CI：`.github/workflows/build.yml` 跑测试 + 四档构建并上传 dist 产物。
 
 ### 双版本构建（4.0.x / 4.1.x）
