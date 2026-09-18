@@ -104,11 +104,12 @@ public class SimpleTranslator(
     {
         var loadedFileCount = 0;
 
-        var partiallyCoveredFiles = new List<(string fileName, int covered, int total)>();
+        var partiallyCoveredFiles = new List<(string fileName, int covered, int added, int total)>();
         var nonCoveredFiles = new List<string>();
         var fullyCoveredFiles = new List<string>();
 
-        var addedLocalesCountByLang = new Dictionary<string, int>();
+        // 语言级写入统计：(写入键数, 覆盖基底, 新增键)
+        var writtenLocalesByLang = new Dictionary<string, (int written, int baseCovered, int added)>();
 
         var modPath = modHelper.GetAbsolutePathToModFolder(Assembly.GetExecutingAssembly());
 
@@ -173,33 +174,35 @@ public class SimpleTranslator(
 #endif
             var targetAvailable = localeGlobal.ContainsKey(locale);
 
-            // 逐文件统计 covered/total 并写入报告（语义不变；T4 统一修正"生效"判定）
+            // 逐文件统计并写入报告。生效语义（与报告一致）：
+            //   覆盖 = 胜出且基底存在；新增 = 胜出但基底不存在；被同键其他文件覆盖的败方两者都不算
             foreach (var (relativeFile, content) in parsedFiles)
             {
                 var totalFields = content.Count;
                 var coveredFields = 0;
+                var newKeyFields = 0;
                 foreach (var kvp in content)
                 {
-                    // 键存在于英文或目标语言现有字典 = 覆盖了一条游戏原文 = 生效
-                    var covered = referenceLocales.ContainsKey(kvp.Key)
-                                  || (targetLocaleRef?.ContainsKey(kvp.Key) ?? false);
-                    if (covered)
+                    // 基底 = 英文或目标语言现有字典；胜出 = 本文件是同键最终生效值的来源文件
+                    var baseExists = referenceLocales.ContainsKey(kvp.Key)
+                                     || (targetLocaleRef?.ContainsKey(kvp.Key) ?? false);
+                    var winnerFile = merged.WinningFile(kvp.Key);
+                    var isWinner = winnerFile == relativeFile;
+                    if (isWinner && baseExists)
                     {
                         coveredFields++;
                     }
-                    report?.AddLocale(relativeFile, kvp.Key, kvp.Value, covered);
+                    else if (isWinner)
+                    {
+                        newKeyFields++;
+                    }
+                    report?.AddLocale(relativeFile, kvp.Key, kvp.Value, baseExists, isWinner, winnerFile);
                 }
 
                 if (!targetAvailable)
                 {
                     continue;
                 }
-
-                if (!addedLocalesCountByLang.ContainsKey(locale))
-                {
-                    addedLocalesCountByLang[locale] = 0;
-                }
-                addedLocalesCountByLang[locale] += coveredFields;
 
                 var fileName = System.IO.Path.GetFileName(relativeFile);
                 if (coveredFields == 0)
@@ -208,12 +211,21 @@ public class SimpleTranslator(
                 }
                 else if (coveredFields < totalFields)
                 {
-                    partiallyCoveredFiles.Add((fileName, coveredFields, totalFields));
+                    partiallyCoveredFiles.Add((fileName, coveredFields, newKeyFields, totalFields));
                 }
                 else
                 {
                     fullyCoveredFiles.Add(fileName);
                 }
+            }
+
+            // 语言级写入统计：进入合并结果的每个键都会写入目标语言字典，
+            // 其中基底存在的为覆盖基底，基底不存在的为新增键
+            if (targetAvailable && merged.Values.Count > 0)
+            {
+                var baseCovered = merged.Values.Keys.Count(k =>
+                    referenceLocales.ContainsKey(k) || (targetLocaleRef?.ContainsKey(k) ?? false));
+                writtenLocalesByLang[locale] = (merged.Values.Count, baseCovered, merged.Values.Count - baseCovered);
             }
 
             // 冲突报告：覆盖链上每一对相邻覆盖记一条（后者覆盖前者）
@@ -301,7 +313,7 @@ public class SimpleTranslator(
             });
         }
 
-        LogStatistics(loadedFileCount, addedLocalesCountByLang, fullyCoveredFiles, partiallyCoveredFiles, nonCoveredFiles, logger);
+        LogStatistics(loadedFileCount, writtenLocalesByLang, fullyCoveredFiles, partiallyCoveredFiles, nonCoveredFiles, logger);
 
         // 处理 dialogue 本地化
         LoadDialogueLocalizations(modPath, report);
@@ -380,9 +392,9 @@ public class SimpleTranslator(
     /// </summary>
     private static void LogStatistics(
         int loadedFileCount,
-        Dictionary<string, int> addedLocalesCountByLang,
+        Dictionary<string, (int written, int baseCovered, int added)> writtenLocalesByLang,
         List<string> fullyCoveredFiles,
-        List<(string fileName, int covered, int total)> partiallyCoveredFiles,
+        List<(string fileName, int covered, int added, int total)> partiallyCoveredFiles,
         List<string> nonCoveredFiles,
         ISptLogger<SimpleTranslator> logger)
     {
@@ -390,8 +402,8 @@ public class SimpleTranslator(
 
         foreach (var locale in ServerLocales)
         {
-            var count = addedLocalesCountByLang.TryGetValue(locale, out var c) ? c : 0;
-            logger.Info($"[文本汉化]  - 总计: {count} 字段");
+            var (written, baseCovered, added) = writtenLocalesByLang.TryGetValue(locale, out var s) ? s : (0, 0, 0);
+            logger.Info($"[文本汉化]  - {locale}: 写入 {written} 个键（覆盖基底 {baseCovered} / 新增键 {added}）");
             logger.Info(string.Empty);
         }
 
@@ -410,14 +422,15 @@ public class SimpleTranslator(
             LogColored(logger, $"[文本汉化]部分覆盖 文本列表:", Color.Yellow);
             foreach (var f in partiallyCoveredFiles)
             {
-                logger.Info($"  - {f.fileName} ({f.covered}/{f.total} 字段)");
+                var overridden = f.total - f.covered - f.added;
+                logger.Info($"  - {f.fileName}（覆盖基底 {f.covered}/{f.total}；新增键 {f.added}；被同键覆盖 {overridden}）");
             }
             logger.Info(string.Empty);
         }
 
         if (nonCoveredFiles.Count > 0)
         {
-            LogColored(logger, $"[文本汉化]未覆盖 文本列表:", Color.Red);
+            LogColored(logger, $"[文本汉化]未覆盖基底 文本列表（词条可能为新增键或被其他文件同键覆盖，详见报告）:", Color.Red);
             foreach (var f in nonCoveredFiles)
             {
                 logger.Info($"  - {f}");

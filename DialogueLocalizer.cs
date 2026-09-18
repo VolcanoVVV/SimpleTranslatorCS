@@ -106,7 +106,8 @@ internal static class DialogueLocalizer
             info($"[Dialogue本地化] {locale}: 更新了 {updatedDialogueCount} 个对话元素，共 {updatedTextCount} 条文本");
         }
 
-        // 开发模式：记录每条 dialogue 词条是否匹配到了对话元素（在键并集中即生效）
+        // 开发模式：记录每条 dialogue 词条是否匹配到对话元素——
+        // 匹配到即已写入对应语言槽位；未匹配仅代表未写入，不代表游戏中不存在该对话
         if (report != null)
         {
             foreach (var kvp in entries)
