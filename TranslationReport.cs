@@ -6,10 +6,12 @@ using System.Text.Unicode;
 namespace SimpleTranslatorCS;
 
 /// <summary>
-/// 开发模式报告：收集每条词条的生效状态、跨文件键冲突、占位符解析失败，
+/// 开发模式报告：收集每条词条的状态、跨文件键冲突、占位符解析失败，
 /// 最后导出为带注释的 jsonc。
-/// 生效判定——普通本地化：键存在于 en 或目标语言现有字典（覆盖到了游戏原文）；
-/// dialogue：键匹配到了至少一个对话元素。
+/// 普通本地化条目区分四个维度：基底是否存在（en 或目标语言现有字典）、是否实际写入
+/// （凡进入合并结果的键都会写入目标语言字典）、是否同键最终胜出、胜出文件归属；
+/// 基底不存在的键只标注"新增键，客户端是否引用未知"，不断言其不会显示。
+/// dialogue 条目记录"键是否匹配到至少一个对话元素"（匹配到 = 已写入对应语言槽位）。
 /// 不依赖任何 SPT 类型，日志通过回调外抛，便于单元测试。
 /// </summary>
 internal sealed class TranslationReport
@@ -20,16 +22,19 @@ internal sealed class TranslationReport
         Encoder = JavaScriptEncoder.Create(UnicodeRanges.All)
     };
 
-    private readonly List<(string file, string key, string value, bool covered)> _localeEntries = new();
-    private readonly List<(string file, string key, string value, bool covered)> _dialogueEntries = new();
+    /// <summary>普通本地化条目：baseExists = 键在基底中存在；isWinner = 本条为同键最终生效值；败方时 winnerFile 指向胜出文件</summary>
+    private sealed record LocaleEntry(string File, string Key, string Value, bool BaseExists, bool IsWinner, string? WinnerFile);
+
+    private readonly List<LocaleEntry> _localeEntries = new();
+    private readonly List<(string file, string key, string value, bool matched)> _dialogueEntries = new();
     private readonly List<(string key, string firstFile, string overrideFile)> _conflicts = new();
     private readonly List<(string file, string key, string itemId)> _unresolvedPlaceholders = new();
 
-    public void AddLocale(string file, string key, string value, bool covered)
-        => _localeEntries.Add((file, key, value, covered));
+    public void AddLocale(string file, string key, string value, bool baseExists, bool isWinner, string? winnerFile)
+        => _localeEntries.Add(new LocaleEntry(file, key, value, baseExists, isWinner, winnerFile));
 
-    public void AddDialogue(string file, string key, string value, bool covered)
-        => _dialogueEntries.Add((file, key, value, covered));
+    public void AddDialogue(string file, string key, string value, bool matched)
+        => _dialogueEntries.Add((file, key, value, matched));
 
     /// <summary>记录跨文件键冲突：同一个键被多个文件翻译，后加载的文件覆盖先加载的</summary>
     public void AddConflict(string key, string firstFile, string overrideFile)
@@ -44,22 +49,36 @@ internal sealed class TranslationReport
         try
         {
             var sb = new StringBuilder();
-            var totalCount = _localeEntries.Count + _dialogueEntries.Count;
-            var coveredCount = _localeEntries.Count(e => e.covered) + _dialogueEntries.Count(e => e.covered);
+            var winners = _localeEntries.Count(e => e.IsWinner);
+            var winnersBase = _localeEntries.Count(e => e.IsWinner && e.BaseExists);
+            var winnersNew = winners - winnersBase;
+            var losers = _localeEntries.Count - winners;
+            var losersBase = _localeEntries.Count(e => !e.IsWinner && e.BaseExists);
+            var losersNew = losers - losersBase;
+            var dialogueMatched = _dialogueEntries.Count(e => e.matched);
 
             sb.AppendLine("{");
             sb.AppendLine(" /*");
             sb.AppendLine(" ** [汉化报告] SimpleTranslatorCS 词条生效报告（开发模式生成）");
             sb.AppendLine($" ** [生成时间] {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
-            sb.AppendLine($" ** [统计] 生效 {coveredCount} / 未生效 {totalCount - coveredCount} / 总计 {totalCount}"
-                + $" / 键冲突 {_conflicts.Count} / 占位符解析失败 {_unresolvedPlaceholders.Count}");
+            sb.AppendLine($" ** [统计] 普通本地化：胜出 {winners}（覆盖基底 {winnersBase} / 新增键 {winnersNew}），"
+                + $"被同键覆盖 {losers}（基底存在 {losersBase} / 基底不存在 {losersNew}），总计 {_localeEntries.Count}");
+            sb.AppendLine($" **        Dialogue：已写入 {dialogueMatched} / 未匹配 {_dialogueEntries.Count - dialogueMatched}，总计 {_dialogueEntries.Count}"
+                + $"；键冲突 {_conflicts.Count} / 占位符解析失败 {_unresolvedPlaceholders.Count}");
             sb.AppendLine(" ** [说明] 每条词条上方的注释标记其状态：");
-            sb.AppendLine(" **   [生效]   普通本地化 = 键在英文或中文现有字典中存在（覆盖到了游戏原文）；dialogue = 匹配到了对话元素");
-            sb.AppendLine(" **   [未生效] 键未被游戏数据使用，这条翻译不会显示，请检查键名或对应 mod 是否安装");
+            sb.AppendLine(" **   普通本地化（判定基于启动时的基底快照与本 mod 的合并结果；基底 = en 或目标语言现有字典）：");
+            sb.AppendLine(" **     [胜出]   本条为同键最终生效值。\"覆盖基底\" = 键在基底中存在，本条覆盖了一条游戏原文；");
+            sb.AppendLine(" **              \"新增键\" = 基底中不存在该键，本条已写入字典，但客户端是否引用该键未知");
+            sb.AppendLine(" **     [被覆盖] 同键被其他文件覆盖，本条不是最终生效值，最终生效值来自标注的胜出文件");
+            sb.AppendLine(" **   进入合并结果的键均会写入目标语言字典（目标语言在数据库中不存在时整体不写入，日志另有警告）；");
+            sb.AppendLine(" **   加载顺序在本 mod 之后的其他 mod 仍可能覆盖最终结果，本报告不含其影响");
+            sb.AppendLine(" **   Dialogue 对话：");
+            sb.AppendLine(" **     [已写入] 键匹配到至少一个对话元素，已写入对应语言槽位");
+            sb.AppendLine(" **     [未匹配] 未匹配到任何对话元素，未写入（不代表游戏中不存在该对话，可能键名不符或对应 mod 未安装）");
             sb.AppendLine(" */");
 
-            AppendEntrySection(sb, "普通本地化", _localeEntries);
-            AppendEntrySection(sb, "Dialogue 对话", _dialogueEntries);
+            AppendLocaleSection(sb);
+            AppendDialogueSection(sb);
 
             if (_conflicts.Count > 0)
             {
@@ -86,7 +105,7 @@ internal sealed class TranslationReport
             sb.AppendLine("}");
             // 带 BOM 的 UTF-8：让记事本等编辑器正确识别编码，避免中文按 ANSI 显示为乱码
             File.WriteAllText(path, sb.ToString(), new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
-            info($"[文本汉化]词条生效报告已导出: {path}（生效 {coveredCount}/{totalCount}）");
+            info($"[文本汉化]词条生效报告已导出: {path}（普通本地化胜出 {winners}/{_localeEntries.Count}）");
         }
         catch (Exception ex)
         {
@@ -94,28 +113,58 @@ internal sealed class TranslationReport
         }
     }
 
-    private static void AppendEntrySection(
-        StringBuilder sb,
-        string sectionName,
-        List<(string file, string key, string value, bool covered)> entries)
+    private void AppendLocaleSection(StringBuilder sb)
     {
-        if (entries.Count == 0)
+        if (_localeEntries.Count == 0)
         {
             return;
         }
 
         sb.AppendLine();
-        sb.AppendLine($"    /* ========== {sectionName} ========== */");
+        sb.AppendLine("    /* ========== 普通本地化 ========== */");
 
-        foreach (var group in entries.GroupBy(e => e.file))
+        foreach (var group in _localeEntries.GroupBy(e => e.File))
         {
-            var covered = group.Count(e => e.covered);
+            var winners = group.Count(e => e.IsWinner);
+            var winnersBase = group.Count(e => e.IsWinner && e.BaseExists);
             sb.AppendLine();
-            sb.AppendLine($"    /* [文件] {group.Key} (生效 {covered}/{group.Count()}) */");
+            sb.AppendLine($"    /* [文件] {group.Key}（胜出 {winners}/{group.Count()}：覆盖基底 {winnersBase}，新增键 {winners - winnersBase}） */");
             foreach (var e in group)
             {
-                sb.AppendLine(e.covered ? "    // [生效]" : "    // [未生效]");
+                if (e.IsWinner)
+                {
+                    sb.AppendLine(e.BaseExists
+                        ? "    // [胜出] 覆盖基底词条，本条为最终生效值"
+                        : "    // [胜出] 新增键（基底不存在，已写入；客户端是否引用该键未知）");
+                }
+                else
+                {
+                    sb.AppendLine($"    // [被覆盖] 同键最终生效值来自: {e.WinnerFile}");
+                }
                 // JsonSerializer.Serialize 负责引号包裹与转义，保证报告本身是合法 jsonc
+                sb.AppendLine($"    {JsonSerializer.Serialize(e.Key, JsonOptions)}: {JsonSerializer.Serialize(e.Value, JsonOptions)},");
+            }
+        }
+    }
+
+    private void AppendDialogueSection(StringBuilder sb)
+    {
+        if (_dialogueEntries.Count == 0)
+        {
+            return;
+        }
+
+        sb.AppendLine();
+        sb.AppendLine("    /* ========== Dialogue 对话 ========== */");
+
+        foreach (var group in _dialogueEntries.GroupBy(e => e.file))
+        {
+            var matched = group.Count(e => e.matched);
+            sb.AppendLine();
+            sb.AppendLine($"    /* [文件] {group.Key} (已写入 {matched}/{group.Count()}) */");
+            foreach (var e in group)
+            {
+                sb.AppendLine(e.matched ? "    // [已写入]" : "    // [未匹配]");
                 sb.AppendLine($"    {JsonSerializer.Serialize(e.key, JsonOptions)}: {JsonSerializer.Serialize(e.value, JsonOptions)},");
             }
         }

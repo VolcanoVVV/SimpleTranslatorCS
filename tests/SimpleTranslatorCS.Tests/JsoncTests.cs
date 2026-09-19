@@ -67,8 +67,82 @@ public class JsoncTests
     [TestMethod]
     public void Normalize_RemovesTrailingCommas()
     {
+        // Normalize 现在基于原生解析选项重写为严格 JSON（压缩格式），
+        // 字符串内的 ,} / ,] 不会被误删
         var result = Jsonc.Normalize("""{ "a": "1", "b": "2", }""");
-        Assert.AreEqual("""{ "a": "1", "b": "2"}""", result);
+        Assert.AreEqual("""{"a":"1","b":"2"}""", result);
+    }
+
+    [TestMethod]
+    public void Normalize_RemovesTrailingCommasInArrays()
+    {
+        var result = Jsonc.Normalize("""{ "a": "1", "arr": [1, 2,], }""");
+        Assert.AreEqual("""{"a":"1","arr":[1,2]}""", result);
+    }
+
+    [TestMethod]
+    public void Normalize_KeepsCommaBraceInsideStringValue()
+    {
+        var result = Jsonc.Normalize("""{ "text": "hello,}", }""");
+        Assert.AreEqual("""{"text":"hello,}"}""", result);
+    }
+
+    [TestMethod]
+    public void ParseFile_CommaBraceInsideStringValue_NotCorrupted()
+    {
+        // 核心回归：字符串值内的 ,} 不是尾随逗号，绝不能被改写（旧正则实现的缺陷）
+        var path = WriteTempFile("comma-brace.jsonc", """{ "text": "hello,}" }""");
+        var result = Jsonc.ParseFile(path, null);
+        Assert.IsNotNull(result);
+        Assert.AreEqual("hello,}", result["text"]);
+    }
+
+    [TestMethod]
+    public void ParseFile_CommaBracketInsideStringValue_NotCorrupted()
+    {
+        // 核心回归：字符串值内的 ,] 同样不能被改写
+        var path = WriteTempFile("comma-bracket.jsonc", """{ "text": "hello,]" }""");
+        var result = Jsonc.ParseFile(path, null);
+        Assert.IsNotNull(result);
+        Assert.AreEqual("hello,]", result["text"]);
+    }
+
+    [TestMethod]
+    public void ParseFile_JsonExtension_ToleratesCommentsAndTrailingComma()
+    {
+        // .json 与 .jsonc 走同一套原生选项，行为一致
+        var path = WriteTempFile("a.json", """
+        {
+            // 注释
+            "k1": "v1",
+        }
+        """);
+        var result = Jsonc.ParseFile(path, null);
+        Assert.IsNotNull(result);
+        Assert.AreEqual("v1", result["k1"]);
+    }
+
+    [TestMethod]
+    public void ParseFile_CommentLikeTextInsideStringValue_Preserved()
+    {
+        var path = WriteTempFile("commentlike.jsonc",
+            """{ "a": "这不是 // 注释", "b": "这也不是 /* 注释 */" }""");
+        var result = Jsonc.ParseFile(path, null);
+        Assert.IsNotNull(result);
+        Assert.AreEqual("这不是 // 注释", result["a"]);
+        Assert.AreEqual("这也不是 /* 注释 */", result["b"]);
+    }
+
+    [TestMethod]
+    public void ParseFile_InvalidJson_WarningContainsLineNumber()
+    {
+        // 第 2 行出错，warn 信息应包含 1 起始的行号便于定位
+        var path = WriteTempFile("broken-line.jsonc", "{ \"a\": \"1\",\n  \"b\": }");
+        var warnings = new List<string>();
+        var result = Jsonc.ParseFile(path, warnings.Add);
+        Assert.IsNull(result);
+        Assert.IsTrue(warnings.Exists(w => w.Contains("解析文件失败") && w.Contains("行号") && w.Contains('2')),
+            $"warn 信息应包含行号: {string.Join(" | ", warnings)}");
     }
 
     [TestMethod]
