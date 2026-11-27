@@ -15,7 +15,7 @@ public class S0RegressionTests
     public void ReleaseMetadata_AcceptsItsTargetServerVersion()
     {
         var metadata = new ModMetadata();
-        Assert.AreEqual("1.14.0", metadata.Version.ToString());
+        Assert.AreEqual("1.5.0", metadata.Version.ToString());
 #if SPT40
         Assert.IsTrue(metadata.SptVersion.IsSatisfied(new SemanticVersioning.Version("4.0.9"), false));
         Assert.IsFalse(metadata.SptVersion.IsSatisfied(new SemanticVersioning.Version("4.1.2"), false));
