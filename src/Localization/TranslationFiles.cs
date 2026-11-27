@@ -6,6 +6,8 @@ namespace SimpleTranslatorCS;
 /// </summary>
 internal static class TranslationFiles
 {
+    // Dialogue 使用普通 Dictionary，不能沿用 4.1 Global 的比较规则。
+    public static StringComparer DialogueKeyComparer { get; } = StringComparer.Ordinal;
     /// <summary>
     /// 目标语言字典实际的键比较规则：
     /// 4.1 的 GlobalLocaleDictionary 实测为 OrdinalIgnoreCase（ILSpy 验证，见 docs/ARCHITECTURE_REVIEW.zh-CN.md），
@@ -43,7 +45,7 @@ internal static class TranslationFiles
         {
             return new List<string>();
         }
-        return Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories)
+        return Directory.EnumerateFiles(dir, "*", new EnumerationOptions { RecurseSubdirectories = true, AttributesToSkip = FileAttributes.ReparsePoint })
             .Where(IsTranslationFile)
             .OrderBy(f => RelativeSortKey(dir, f), StringComparer.Ordinal)
             .ToList();

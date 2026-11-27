@@ -1,4 +1,9 @@
 using SPTarkov.Server.Core.Models.Eft.Common.Tables;
+#if SPT50
+using DialogueId = SPTarkov.Server.Core.Models.Common.MongoId;
+#else
+using DialogueId = System.String;
+#endif
 
 namespace SimpleTranslatorCS;
 
@@ -30,7 +35,7 @@ internal static class DialogueLocalizer
         }
         if (dialogue?.Elements == null)
         {
-            warn("[Dialogue本地化]无法获取 dialogue 数据");
+            warn("[文本汉化][对话]无法获取 dialogue 数据");
             return;
         }
 
@@ -45,7 +50,7 @@ internal static class DialogueLocalizer
             }
             foreach (var dict in element.LocalizationDictionary.Values)
             {
-                allKnownKeys.UnionWith(dict.Keys);
+                allKnownKeys.UnionWith(dict.Keys.Select(key => key.ToString()));
             }
         }
 
@@ -57,19 +62,19 @@ internal static class DialogueLocalizer
         {
             if (element.LocalizationDictionary == null)
             {
-                element.LocalizationDictionary = new Dictionary<string, Dictionary<string, string>>();
+                element.LocalizationDictionary = new Dictionary<string, Dictionary<DialogueId, string>>();
             }
 
             // 本元素出现过的键（任意语言），建成集合避免内层再遍历语言
             var elementKeys = new HashSet<string>();
             foreach (var dict in element.LocalizationDictionary.Values)
             {
-                elementKeys.UnionWith(dict.Keys);
+                elementKeys.UnionWith(dict.Keys.Select(key => key.ToString()));
             }
 
             if (!element.LocalizationDictionary.TryGetValue(locale, out var localeDict))
             {
-                localeDict = new Dictionary<string, string>();
+                localeDict = new Dictionary<DialogueId, string>();
                 element.LocalizationDictionary[locale] = localeDict;
             }
 
@@ -83,7 +88,7 @@ internal static class DialogueLocalizer
                 }
 
                 var unresolved = report != null ? new List<string>() : null;
-                localeDict[kvp.Key] = ItemPlaceholders.Resolve(kvp.Value.value, targetLocaleRef, enLocaleRef, unresolved);
+                localeDict[(DialogueId)kvp.Key] = ItemPlaceholders.Resolve(kvp.Value.value, targetLocaleRef, enLocaleRef, unresolved);
                 if (unresolved != null)
                 {
                     foreach (var id in unresolved)
@@ -103,7 +108,7 @@ internal static class DialogueLocalizer
 
         if (updatedDialogueCount > 0)
         {
-            info($"[Dialogue本地化] {locale}: 更新了 {updatedDialogueCount} 个对话元素，共 {updatedTextCount} 条文本");
+            info($"文本汉化 | 对话已写入 {locale} 语言槽位：更新 {updatedDialogueCount} 个对话元素，共写入 {updatedTextCount} 条文本。");
         }
 
         // 开发模式：记录每条 dialogue 词条是否匹配到对话元素——

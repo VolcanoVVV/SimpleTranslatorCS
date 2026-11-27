@@ -140,7 +140,8 @@ internal static class Jsonc
     /// - 非字符串值：跳过并 warn 提示；
     /// - 解析失败：warn 提示（含 JsonException 的行号/行内字节位置）并返回 null。
     /// </summary>
-    public static Dictionary<string, string>? ParseFile(string path, Action<string>? warn)
+    public static Dictionary<string, string>? ParseFile(string path, Action<string>? warn,
+        IEqualityComparer<string>? comparer = null, Action<string>? error = null)
     {
         try
         {
@@ -148,11 +149,11 @@ internal static class Jsonc
             using var doc = JsonDocument.Parse(raw, s_parseOptions);
             if (doc.RootElement.ValueKind != JsonValueKind.Object)
             {
-                warn?.Invoke($"翻译文件顶层必须是对象 {{ }}: {path}");
+                (error ?? warn)?.Invoke($"译文文件顶层必须是对象 {{ }}：{path}。");
                 return null;
             }
 
-            var result = new Dictionary<string, string>();
+            var result = new Dictionary<string, string>(comparer ?? StringComparer.Ordinal);
             foreach (var prop in doc.RootElement.EnumerateObject())
             {
                 if (prop.Value.ValueKind != JsonValueKind.String)
@@ -168,18 +169,9 @@ internal static class Jsonc
             }
             return result;
         }
-        catch (JsonException ex)
-        {
-            // JsonException 自带 0 起始的行号/行内字节位置，转为编辑器习惯的 1 起始行号便于定位
-            var location = ex.LineNumber is long line
-                ? $"（行号: {line + 1}, 行内字节位置: {ex.BytePositionInLine}）"
-                : "";
-            warn?.Invoke($"解析文件失败: {path}, 错误: {ex.Message}{location}");
-            return null;
-        }
         catch (Exception ex)
         {
-            warn?.Invoke($"解析文件失败: {path}, 错误: {ex.Message}");
+            (error ?? warn)?.Invoke($"解析文件失败：{path}。{ServerLogText.Failure(ex)}");
             return null;
         }
     }

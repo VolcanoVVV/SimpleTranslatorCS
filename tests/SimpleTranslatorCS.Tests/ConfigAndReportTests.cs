@@ -46,6 +46,59 @@ public class ModConfigTests
     }
 
     [TestMethod]
+    public void FikaAdminKey_FirstUseGeneratesRandomPersistentCommentedValue()
+    {
+        var first = WorkbenchAccess.EnsureKey(_tempDir, string.Empty);
+        Assert.AreEqual(64, first.Length);
+        Assert.IsTrue(first.All(Uri.IsHexDigit));
+        var text = File.ReadAllText(Path.Combine(_tempDir, WorkbenchAccess.KeyFileName));
+        StringAssert.Contains(text, "服务端汉化管理员密钥");
+        Assert.IsFalse(File.Exists(Path.Combine(_tempDir, "config.jsonc")));
+        Assert.AreEqual(first, WorkbenchAccess.EnsureKey(_tempDir, string.Empty));
+        Assert.IsTrue(WorkbenchAccess.FixedEquals(first, WorkbenchAccess.EnsureKey(_tempDir, "old-key")));
+        Assert.IsFalse(WorkbenchAccess.FixedEquals(first, "wrong"));
+    }
+
+    [TestMethod]
+    public void AdminKey_DoesNotRewriteCommentedConfig_AndMigratesLegacyValue()
+    {
+        var configPath = Path.Combine(_tempDir, "config.jsonc");
+        const string config = "{\n // example: \"workbenchAdminKey\": \"\"\n \"devMode\": false // trailing comment\n}\n";
+        File.WriteAllText(configPath, config);
+        var key = WorkbenchAccess.EnsureKey(_tempDir, string.Empty);
+        Assert.AreEqual(key, WorkbenchAccess.EnsureKey(_tempDir, string.Empty));
+        Assert.AreEqual(config, File.ReadAllText(configPath));
+        File.Delete(Path.Combine(_tempDir, WorkbenchAccess.KeyFileName));
+        Assert.AreEqual("legacy-key", WorkbenchAccess.EnsureKey(_tempDir, " legacy-key "));
+        Assert.AreEqual("legacy-key", WorkbenchAccess.EnsureKey(_tempDir, "different-legacy-key"));
+    }
+
+    [TestMethod]
+    public void AdminKey_CorruptDedicatedFileFailsClosedWithoutOverwriting()
+    {
+        var path = Path.Combine(_tempDir, WorkbenchAccess.KeyFileName);
+        File.WriteAllText(path, "{ broken");
+        try { WorkbenchAccess.EnsureKey(_tempDir, "legacy"); Assert.Fail("应拒绝损坏的密钥文件。"); }
+        catch (JsonException) { }
+        Assert.AreEqual("{ broken", File.ReadAllText(path));
+    }
+
+    [TestMethod]
+    public void PullCooldown_DefaultAndBounds()
+    {
+        foreach (var value in new[] { "null", "\"180\"", "-1", "86401" })
+        {
+            File.WriteAllText(Path.Combine(_tempDir, "config.jsonc"), "{\"pullCooldownSeconds\":" + value + "}");
+            Assert.AreEqual(180, ModConfig.Load(_tempDir, null).PullCooldownSeconds);
+        }
+        foreach (var value in new[] { 0, 30, 180, 86400 })
+        {
+            File.WriteAllText(Path.Combine(_tempDir, "config.jsonc"), "{\"pullCooldownSeconds\":" + value + "}");
+            Assert.AreEqual(value, ModConfig.Load(_tempDir, null).PullCooldownSeconds);
+        }
+    }
+
+    [TestMethod]
     public void Load_BrokenJson_ReturnsDefaultAndWarns()
     {
         File.WriteAllText(Path.Combine(_tempDir, "config.jsonc"), "{ 这不是合法 json");

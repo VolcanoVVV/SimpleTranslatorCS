@@ -1,15 +1,16 @@
 <Project>
   <!--
-    双版本构建的中间目录隔离，必须在 SDK props 导入前设置（微软官方要求），
+    多版本构建的中间目录隔离，必须在 SDK props 导入前设置（微软官方要求），
     否则会有 MSB3539 警告且 NuGet 资产路径与中间目录不一致。
 
     SptTarget 推导顺序：
-      1. 命令行显式指定 -p:SptTarget=4.0 / 4.1（最高优先）
-      2. 从 Configuration 名推导（VS 配置：4.0 Debug / 4.0 Release / 4.1 Debug / 4.1 Release）
+      1. 命令行显式指定 -p:SptTarget=4.0 / 4.1 / 5.0be（最高优先）
+      2. 从 Configuration 名推导（VS 配置：4.0 / 4.1 / 5.0be × Debug / Release）
       3. 都没有时默认 4.1（即普通 Debug/Release 配置面向 SPT 4.1.x）
   -->
   <PropertyGroup>
     <SptTarget Condition="'$(SptTarget)' == '' and $([System.String]::Copy('$(Configuration)').StartsWith('4.0'))">4.0</SptTarget>
+    <SptTarget Condition="'$(SptTarget)' == '' and $([System.String]::Copy('$(Configuration)').StartsWith('5.0be'))">5.0be</SptTarget>
     <SptTarget Condition="'$(SptTarget)' == ''">4.1</SptTarget>
     <BaseIntermediateOutputPath>obj\$(SptTarget)\</BaseIntermediateOutputPath>
   </PropertyGroup>

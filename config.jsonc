@@ -4,12 +4,20 @@
  ** devMode    开发/日志模式：true 时，服务器启动加载完所有翻译后，
  **            会把每条词条按 [生效] / [未生效] 导出成报告 jsonc，
  **            用于排查哪些键写错了或对应 mod 没装。
- ** reportFile 报告输出文件名（相对 mod 目录），默认 translation-report.jsonc
+ ** reportFile 报告输出文件名（相对 mod 目录），默认 cache/reports/translation-report.jsonc
  **
- ** 生效判定：普通本地化 = 键在英文参考库中存在（覆盖到了游戏原文）；
+ ** 生效判定：普通本地化 = 统计胜出键覆盖英文或当前中文基底，以及新增键；
  **           dialogue = 键匹配到了至少一个对话元素。
- ** [未生效] 的词条不会显示在游戏里，请检查键名拼写或对应 mod 是否安装。
+ ** 新增键已进入中文表，是否显示取决于游戏或模组是否引用该键。
  */
     "devMode": false,
-    "reportFile": "translation-report.jsonc"
+    "reportFile": "cache/reports/translation-report.jsonc",
+
+    // 非管理员手动拉取已生效译文的冷却时间（秒），按玩家会话计算；默认 180 秒。
+    // 0 表示不限制；允许范围 0～86400。修改后重启服务端生效；管理员不受此限制。
+    // 管理员密钥由首次启动生成，单独保存在 workbench-admin.jsonc，请勿公开该文件。
+    "pullCooldownSeconds": 180,
+    // 可选：开放已加载英文语言表中其他缺失文本（界面、藏身处、模组自定义 locale 键）。
+    // 不扫描对象字段、玩家数据或硬编码界面；开启后出现在独立来源中，请先人工抽查。
+    "includeOtherLocaleText": false
 }

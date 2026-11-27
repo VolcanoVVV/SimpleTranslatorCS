@@ -1,11 +1,18 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFramework Condition="'$(SptTarget)' != '4.0'">net10.0</TargetFramework>
+    <TargetFramework Condition="'$(SptTarget)' == '4.0'">net9.0</TargetFramework>
+    <DefineConstants Condition="'$(SptTarget)' == '4.0'">$(DefineConstants);SPT40</DefineConstants>
+    <DefineConstants Condition="'$(SptTarget)' == '5.0be'">$(DefineConstants);SPT50</DefineConstants>
+    <Spt50RuntimePath Condition="'$(SptTarget)' == '5.0be'">$(MSBuildProjectDirectory)\..\..\..\..\EFToffline - 5.0debug\SPT_Runtime</Spt50RuntimePath>
+    <AssemblySearchPaths Condition="'$(SptTarget)' == '5.0be'">{HintPathFromItem};{CandidateAssemblyFiles};{TargetFrameworkDirectory};{RawFileName}</AssemblySearchPaths>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
+    <NuGetAudit>false</NuGetAudit>
+    <MSBuildWarningsAsMessages>$(MSBuildWarningsAsMessages);MSB3052</MSBuildWarningsAsMessages>
   </PropertyGroup>
 
   <ItemGroup>
@@ -16,6 +23,17 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\SimpleTranslatorCS.csproj" />
+    <Compile Remove="obj\**\*.cs" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(SptTarget)' == '5.0be'">
+    <Reference Include="SPTarkov.Common"><HintPath>$(Spt50RuntimePath)\SPTarkov.Common.dll</HintPath></Reference>
+    <Reference Include="SPTarkov.DI"><HintPath>$(Spt50RuntimePath)\SPTarkov.DI.dll</HintPath></Reference>
+    <Reference Include="SPTarkov.Server.Core"><HintPath>$(Spt50RuntimePath)\SPTarkov.Server.Core.dll</HintPath></Reference>
+    <Reference Include="SPTarkov.Server.Web"><HintPath>$(Spt50RuntimePath)\SPTarkov.Server.Web.dll</HintPath></Reference>
+    <Reference Include="SemanticVersioning"><HintPath>$(Spt50RuntimePath)\SemanticVersioning.dll</HintPath></Reference>
+    <Reference Include="Spectre.Console"><HintPath>$(Spt50RuntimePath)\Spectre.Console.dll</HintPath></Reference>
+    <Reference Include="Spectre.Console.Ansi"><HintPath>$(Spt50RuntimePath)\Spectre.Console.Ansi.dll</HintPath></Reference>
   </ItemGroup>
 
 </Project>

@@ -51,20 +51,25 @@ public class TranslationMergerTests
     [TestMethod]
     public void Merge_CaseOnlyDifference_TreatedAsSameKey_AndChained()
     {
-        // 测试构建走 4.1 分支：KeyComparer = OrdinalIgnoreCase，
-        // 仅大小写不同的键必须按同一键合并并记录覆盖链（4.0 Ordinal 分支为编译期条件，单测覆盖不到）
+        // 两个运行时分别验证真实目标的键规则。
         var merged = TranslationMerger.Merge(new (string File, IReadOnlyDictionary<string, string> Entries)[]
         {
             ("a.json", Dict(("QuestKey", "旧"))),
             ("b.json", Dict(("questkey", "新"))),
         });
 
+#if SPT40
+        Assert.AreEqual(2, merged.Values.Count);
+        Assert.AreEqual("旧", merged.Values["QuestKey"]);
+        Assert.AreEqual("新", merged.Values["questkey"]);
+#else
         Assert.AreEqual(1, merged.Values.Count);
         Assert.AreEqual("新", merged.Values["QUESTKEY"]);
         CollectionAssert.AreEqual(
             new List<string> { "a.json", "b.json" },
             merged.OverrideChains["questkey"].ToList());
         Assert.AreEqual("b.json", merged.WinningFile("QuestKey"));
+#endif
     }
 
     [TestMethod]
@@ -78,11 +83,18 @@ public class TranslationMergerTests
             ("b.json", Dict(("KEY", "3"))),
         });
 
+#if SPT40
+        Assert.AreEqual(3, merged.Values.Count);
+        Assert.AreEqual("1", merged.Values["Key"]);
+        Assert.AreEqual("2", merged.Values["key"]);
+        Assert.AreEqual("3", merged.Values["KEY"]);
+#else
         Assert.AreEqual(1, merged.Values.Count);
         Assert.AreEqual("3", merged.Values["key"]);
         CollectionAssert.AreEqual(
             new List<string> { "a.json", "b.json" },
             merged.OverrideChains["key"].ToList());
+#endif
     }
 
     [TestMethod]

@@ -1,3 +1,5 @@
+using System.Collections.ObjectModel;
+
 namespace SimpleTranslatorCS;
 
 /// <summary>
@@ -7,7 +9,7 @@ namespace SimpleTranslatorCS;
 internal sealed class MergedTranslations
 {
     /// <summary>合并后的原始键值（同键后文件覆盖前文件），键比较器与目标容器一致</summary>
-    public required Dictionary<string, string> Values { get; init; }
+    public required IReadOnlyDictionary<string, string> Values { get; init; }
 
     /// <summary>键 -> 完整覆盖链（所有定义过该键的文件，按加载顺序，最后一个为胜出文件）</summary>
     public required IReadOnlyDictionary<string, IReadOnlyList<string>> OverrideChains { get; init; }
@@ -20,7 +22,7 @@ internal sealed class MergedTranslations
 /// <summary>
 /// 全量合并器：把按稳定排序（即优先级）排列的多个翻译文件合并为一个字典。
 /// 排序即优先级——同键后文件覆盖前文件；比较器用 <see cref="TranslationFiles.KeyComparer"/>，
-/// 与目标容器一致，仅大小写不同的键按同一键合并。不依赖任何 SPT 类型，便于单元测试。
+/// 与目标 Global 容器一致；4.1 忽略大小写，4.0 区分大小写。不依赖任何 SPT 类型。
 /// </summary>
 internal static class TranslationMerger
 {
@@ -50,11 +52,32 @@ internal static class TranslationMerger
 
         return new MergedTranslations
         {
-            Values = values,
-            OverrideChains = chains.ToDictionary(
+            Values = new ReadOnlyDictionary<string, string>(values),
+            OverrideChains = new ReadOnlyDictionary<string, IReadOnlyList<string>>(chains.ToDictionary(
                 p => p.Key,
-                p => (IReadOnlyList<string>)p.Value,
-                TranslationFiles.KeyComparer),
+                p => (IReadOnlyList<string>)p.Value.AsReadOnly(),
+                TranslationFiles.KeyComparer)),
         };
+    }
+
+    /// <summary>一次构建始终从同一份原始合并视图解析，不读取已解析后写回的值。</summary>
+    public static void ApplyTo(
+        Dictionary<string, string> target,
+        MergedTranslations merged,
+        IReadOnlyDictionary<string, string>? fallback,
+        Action<string, string>? unresolved = null)
+    {
+        var source = new Dictionary<string, string>(target, target.Comparer);
+        foreach (var pair in merged.Values)
+            source[pair.Key] = pair.Value;
+
+        foreach (var pair in merged.Values)
+        {
+            var missing = unresolved == null ? null : new List<string>();
+            target[pair.Key] = ItemPlaceholders.Resolve(pair.Value, source, fallback, missing);
+            if (missing != null)
+                foreach (var id in missing)
+                    unresolved!(pair.Key, id);
+        }
     }
 }

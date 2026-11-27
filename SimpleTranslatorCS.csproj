@@ -1,25 +1,29 @@
 <Project Sdk="Microsoft.NET.Sdk.Web">
 
   <!--
-    双版本构建（SptTarget 推导规则与中间目录隔离见 Directory.Build.props）：
+    多版本构建（SptTarget 推导规则与中间目录隔离见 Directory.Build.props）：
       dotnet build                       -> 面向 SPT 4.1.x（Debug），产物进 dist-debug/
       dotnet build -c Release            -> 面向 SPT 4.1.x，产物进 dist/
       dotnet build -c "4.0 Release"      -> 面向 SPT 4.0.x，产物进 dist-4.0/
+      dotnet build -c "5.0be Release"    -> 面向 SPT 5.0 BE，产物进 dist-5.0be/
       dotnet build -c "4.1 Debug"        -> 面向 SPT 4.1.x，产物进 dist-debug/
-    VS 配置管理器里选 4.0/4.1 × Debug/Release 四档即可，效果同上。
-    4.1 依赖来自 NuGet 包，4.0 依赖来自 tref/ 下的本地 dll。
+    VS 配置管理器里选 4.0/4.1/5.0be × Debug/Release 即可，效果同上。
+    4.x 依赖来自 NuGet 包，5.0be 依赖来自本机 SPT 运行时。
   -->
   <PropertyGroup>
     <RootNamespace>SimpleTranslatorCS</RootNamespace>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <OutputType>Library</OutputType>
-    <Version>1.4.0</Version>
+    <!-- 由维护者指定，功能修改不自动递增；见 docs/VERSION_POLICY.zh-CN.md。 -->
+    <Version>1.5.0</Version>
+    <!-- 工作区功能尚未形成对应提交时，不把旧 HEAD 伪装成当前二进制来源。 -->
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <OutputPath>bin\$(Configuration)\$(SptTarget)\$(AssemblyName)\</OutputPath>
     <!-- 告诉 VS 配置管理器本项目支持的全部配置名 -->
-    <Configurations>Debug;Release;4.0 Debug;4.0 Release;4.1 Debug;4.1 Release</Configurations>
+    <Configurations>Debug;Release;4.0 Debug;4.0 Release;4.1 Debug;4.1 Release;5.0be Debug;5.0be Release</Configurations>
     <!-- 自定义配置名会被 SDK 自动转成一个 /define 常量，"4.0 Release" 转出的 4_0_RELEASE
          不是合法标识符而产生 MSB3052 警告，该常量无用，降级为消息屏蔽 -->
     <MSBuildWarningsAsMessages>$(MSBuildWarningsAsMessages);MSB3052</MSBuildWarningsAsMessages>
@@ -33,13 +37,13 @@
   <!-- 自定义配置名（4.0 Debug 等）不会自动继承 Debug/Release 的编译语义，按名字补齐：
        Debug = 不优化 + 完整调试符号 + 定义 DEBUG/TRACE，用于排错；
        Release = 开优化 + 定义 TRACE，用于发布。 -->
-  <PropertyGroup Condition="$([System.String]::Copy('$(Configuration)').StartsWith('4.')) and $([System.String]::Copy('$(Configuration)').EndsWith('Debug'))">
+  <PropertyGroup Condition="($([System.String]::Copy('$(Configuration)').StartsWith('4.')) or $([System.String]::Copy('$(Configuration)').StartsWith('5.'))) and $([System.String]::Copy('$(Configuration)').EndsWith('Debug'))">
     <DefineConstants>$(DefineConstants);DEBUG;TRACE</DefineConstants>
     <Optimize>false</Optimize>
     <DebugSymbols>true</DebugSymbols>
     <DebugType>full</DebugType>
   </PropertyGroup>
-  <PropertyGroup Condition="$([System.String]::Copy('$(Configuration)').StartsWith('4.')) and $([System.String]::Copy('$(Configuration)').EndsWith('Release'))">
+  <PropertyGroup Condition="($([System.String]::Copy('$(Configuration)').StartsWith('4.')) or $([System.String]::Copy('$(Configuration)').StartsWith('5.'))) and $([System.String]::Copy('$(Configuration)').EndsWith('Release'))">
     <DefineConstants>$(DefineConstants);TRACE</DefineConstants>
     <Optimize>true</Optimize>
   </PropertyGroup>
@@ -58,11 +62,18 @@
     <TargetFramework>net10.0</TargetFramework>
   </PropertyGroup>
 
+  <PropertyGroup Condition="'$(SptTarget)' == '5.0be'">
+    <DefineConstants>$(DefineConstants);SPT50</DefineConstants>
+    <DistDir>$(MSBuildProjectDirectory)\dist-5.0be$(DistDirSuffix)</DistDir>
+    <Spt50RuntimePath Condition="'$(Spt50RuntimePath)' == ''">$(MSBuildProjectDirectory)\..\..\EFToffline - 5.0debug\SPT_Runtime</Spt50RuntimePath>
+    <AssemblySearchPaths>{HintPathFromItem};{CandidateAssemblyFiles};{TargetFrameworkDirectory};{RawFileName}</AssemblySearchPaths>
+  </PropertyGroup>
+
   <PropertyGroup Condition="'$(SptTarget)' == '4.0'">
     <DefineConstants>$(DefineConstants);SPT40</DefineConstants>
     <DistDir>$(MSBuildProjectDirectory)\dist-4.0$(DistDirSuffix)</DistDir>
   </PropertyGroup>
-  <PropertyGroup Condition="'$(SptTarget)' != '4.0'">
+  <PropertyGroup Condition="'$(SptTarget)' == '4.1'">
     <DistDir>$(MSBuildProjectDirectory)\dist$(DistDirSuffix)</DistDir>
   </PropertyGroup>
 
@@ -75,21 +86,43 @@
   </ItemGroup>
 
   <!-- SPT 4.1.x：引用 NuGet 包 -->
-  <ItemGroup Condition="'$(SptTarget)' != '4.0'">
+  <ItemGroup Condition="'$(SptTarget)' == '4.1'">
     <PackageReference Include="SPTarkov.Common" Version="4.1.2" />
     <PackageReference Include="SPTarkov.DI" Version="4.1.2" />
     <PackageReference Include="SPTarkov.Server.Core" Version="4.1.2" />
   </ItemGroup>
 
+  <ItemGroup Condition="'$(SptTarget)' == '5.0be'">
+    <Reference Include="SPTarkov.Common"><HintPath>$(Spt50RuntimePath)\SPTarkov.Common.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="SPTarkov.DI"><HintPath>$(Spt50RuntimePath)\SPTarkov.DI.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="SPTarkov.Reflection"><HintPath>$(Spt50RuntimePath)\SPTarkov.Reflection.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="SPTarkov.Server.Core"><HintPath>$(Spt50RuntimePath)\SPTarkov.Server.Core.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="SPTarkov.Server.Web"><HintPath>$(Spt50RuntimePath)\SPTarkov.Server.Web.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="SemanticVersioning"><HintPath>$(Spt50RuntimePath)\SemanticVersioning.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Spectre.Console"><HintPath>$(Spt50RuntimePath)\Spectre.Console.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Spectre.Console.Ansi"><HintPath>$(Spt50RuntimePath)\Spectre.Console.Ansi.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+
   <ItemGroup>
-    <ChFiles Include="$(MSBuildProjectDirectory)\db\locales\ch\**\*.*" />
+    <ChFiles Include="$(MSBuildProjectDirectory)\translations\ch\**\*.*" />
   </ItemGroup>
 
   <Target Name="CopyToDist" AfterTargets="Build">
-    <MakeDir Directories="$(DistDir)\db\locales\ch" />
+    <MakeDir Directories="$(DistDir)\translations\ch" />
     <Copy SourceFiles="$(TargetDir)SimpleTranslatorCS.dll" DestinationFolder="$(DistDir)" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\README.md" DestinationFolder="$(DistDir)" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\docs\PLAYER_GUIDE.zh-CN.md;$(MSBuildProjectDirectory)\docs\AI_MAINTAINER_GUIDE.zh-CN.md" DestinationFolder="$(DistDir)\docs" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\docs\GLOSSARY_EDITOR.zh-CN.md;$(MSBuildProjectDirectory)\docs\GLOSSARY_EDITOR_MAINTENANCE.zh-CN.md" DestinationFolder="$(DistDir)\docs" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\tools\glossary-editor\index.html;$(MSBuildProjectDirectory)\tools\glossary-editor\glossary-editor.js" DestinationFolder="$(DistDir)\tools\glossary-editor" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\docs\TRANSLATION_OPTIMIZATION_2026-10-06.zh-CN.md" DestinationFolder="$(DistDir)\docs" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\docs\MODEL_DISCOVERY_AND_RELEASE_2026-10-06.zh-CN.md" DestinationFolder="$(DistDir)\docs" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\docs\PROVIDERS_LIVE_SYNC_2026-10-07.zh-CN.md" DestinationFolder="$(DistDir)\docs" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\docs\VERSION_POLICY.zh-CN.md" DestinationFolder="$(DistDir)\docs" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\docs\SERVER_WORKBENCH_DISCOVERY_FIX_2026-10-07.zh-CN.md" DestinationFolder="$(DistDir)\docs" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\glossary\eft.zh-CN.example.tsv" DestinationFolder="$(DistDir)\glossary" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\docs\LEGACY_GLOSSARY_QUIET_SYNC_2026-10-07.zh-CN.md" DestinationFolder="$(DistDir)\docs" />
     <Copy SourceFiles="$(MSBuildProjectDirectory)\config.jsonc" DestinationFolder="$(DistDir)" Condition="Exists('$(MSBuildProjectDirectory)\config.jsonc')" />
-    <Copy SourceFiles="@(ChFiles)" DestinationFiles="@(ChFiles->'$(DistDir)\db\locales\ch\%(RecursiveDir)%(Filename)%(Extension)')" />
+    <Copy SourceFiles="@(ChFiles)" DestinationFiles="@(ChFiles->'$(DistDir)\translations\ch\%(RecursiveDir)%(Filename)%(Extension)')" />
   </Target>
   <ItemGroup>
     <Compile Remove="server-mod-examples\**\*.cs" />

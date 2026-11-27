@@ -1,7 +1,10 @@
+using System.Collections;
 using System.Reflection;
 using SPTarkov.DI.Annotations;
 using SPTarkov.Server.Core.DI;
 using SPTarkov.Server.Core.Models.Spt.Mod;
+using AchievementTable = SPTarkov.Server.Core.Models.Eft.Common.Tables.Achievement;
+using QuestTable = SPTarkov.Server.Core.Models.Eft.Common.Tables.Quest;
 #if SPT40
 // SPT 4.0 的 API 布局（dotnet build -c "4.0 Release"）
 using SPTarkov.Server.Core.Helpers;        // ModHelper
@@ -27,7 +30,7 @@ internal static class ModInfo
 {
     public static readonly string Version =
         typeof(ModInfo).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
-        ?? "1.4.0";
+        ?? "1.11.0";
 }
 
 #if SPT40
@@ -56,7 +59,12 @@ public record ModMetadata : IModMetadata
     public string Author { get; init; } = "MiKueYu & Volcano";
     public List<string>? Contributors { get; init; }
     public SemanticVersioning.Version Version { get; init; } = new(ModInfo.Version);
+#if SPT50
+    // 5.0 BE reports a prerelease such as 5.0.0-BLEEDINGEDGEMODS; ~5.0.0 excludes it.
+    public SemanticVersioning.Range SptVersion { get; init; } = new(">=5.0.0-0 <5.0.0");
+#else
     public SemanticVersioning.Range SptVersion { get; init; } = new("~4.1.0");
+#endif
     public bool HasPrepatcher { get; init; } = false;
     public List<string>? Incompatibilities { get; init; }
     public Dictionary<string, SemanticVersioning.Range>? ModDependencies { get; init; }
@@ -86,14 +94,15 @@ public class SimpleTranslator(
     ModHelper modHelper,
     LocaleService localeService,
     LocaleTable localeTable,
-    TemplateTable templateTable) : IOnLoad
+    TemplateTable templateTable,
+    TradersTable tradersTable) : IOnLoad
 #endif
 {
     // 目标语言（本 mod 只服务中文用户）
     private static readonly string[] ServerLocales = { "ch" };
 
     // devMode 文件监听器需要一直存活，用静态字段持有防止被 GC
-    private static FileSystemWatcher? _fileWatcher;
+    private static readonly Dictionary<string, FileSystemWatcher> FileWatchers = new(StringComparer.OrdinalIgnoreCase);
 
 #if SPT40
     // 4.0 的 IOnLoad 是 OnLoad()，4.1 是 OnLoadAsync(CancellationToken)
@@ -104,18 +113,39 @@ public class SimpleTranslator(
     {
         var loadedFileCount = 0;
 
-        var partiallyCoveredFiles = new List<(string fileName, int covered, int added, int total)>();
-        var nonCoveredFiles = new List<string>();
-        var fullyCoveredFiles = new List<string>();
+        var fileCoverage = new List<FileCoverage>();
 
         // 语言级写入统计：(写入键数, 覆盖基底, 新增键)
-        var writtenLocalesByLang = new Dictionary<string, (int written, int baseCovered, int added)>();
+        var writtenLocalesByLang = new Dictionary<string, (int Written, int Covered, int Added)>();
 
         var modPath = modHelper.GetAbsolutePathToModFolder(Assembly.GetExecutingAssembly());
+        var fikaDetected = WorkbenchAccess.DetectFika(modPath);
 
         // 开发/日志模式：mod 目录下 config.jsonc 中 devMode=true 时，
         // 加载完成后导出词条生效报告，并监听翻译文件变更给出重启提示
         var config = ModConfig.Load(modPath, m => logger.Warning($"[文本汉化]{m}"));
+        // Administrator protection applies to every server, including installations without Fika.
+        {
+            try
+            {
+                var key = WorkbenchAccess.EnsureKey(modPath, config.WorkbenchAdminKey);
+                config = config with { WorkbenchAdminKey = key };
+                logger.Info($"[文本汉化]管理员写入保护已启用。密钥文件：{WorkbenchAccess.KeyFileName}。普通玩家手动拉取冷却：{config.PullCooldownSeconds} 秒。");
+            }
+            catch (Exception ex)
+            {
+                config = config with { WorkbenchAdminKey = string.Empty };
+                logger.Error($"[文本汉化]无法使用管理员密钥，工作台写操作已禁用。请检查 {WorkbenchAccess.KeyFileName}。{ServerLogText.Failure(ex)}");
+            }
+        }
+        try
+        {
+            TranslationWorkbench.PrepareStorage(modPath);
+        }
+        catch (Exception ex)
+        {
+            logger.Warning($"[文本汉化]旧工作台文件归类失败，将继续加载现有文件。{ServerLogText.Failure(ex)}");
+        }
         var report = config.DevMode ? new TranslationReport() : null;
         if (config.DevMode)
         {
@@ -124,16 +154,17 @@ public class SimpleTranslator(
 
         foreach (var locale in ServerLocales)
         {
-            var localePath = System.IO.Path.Combine(modPath, "db", "locales", locale);
-            if (!Directory.Exists(localePath))
+            var localePath = TranslationWorkbench.LocaleRoot(modPath, locale);
+            if (!TranslationWorkbench.LocaleRoots(modPath, locale).Any(Directory.Exists))
             {
-                logger.Info($"[文本汉化]未找到汉化文件夹目录: {locale}, 请检查是否在 SPT/user/mods/SimpleTranslatorCS/db/locales 中已经创建 ch 文件夹");
+                logger.Warning($"[文本汉化]语言 {locale} 没有可读取的译文目录。请在当前 Mod 目录下检查 translations/{locale} 或旧 db/locales/{locale}。");
                 continue;
             }
 
             if (config.DevMode)
             {
-                StartFileWatcher(localePath, logger);
+                foreach (var folder in TranslationWorkbench.LocaleRoots(modPath, locale).Where(Directory.Exists))
+                    StartFileWatcher(folder, logger);
             }
 
             // 生效判定的参考字典：英文为主，目标语言现有字典兜底
@@ -151,16 +182,28 @@ public class SimpleTranslator(
 
             // 枚举 + 解析全部有效翻译文件（稳定排序即优先级：同键后文件覆盖前文件）
             var parsedFiles = new List<(string File, IReadOnlyDictionary<string, string> Entries)>();
-            foreach (var file in TranslationFiles.EnumerateLocaleFiles(localePath))
+            var filterTracked = TranslationWorkbench.StartupFilter(modPath, referenceLocales);
+            foreach (var file in TranslationWorkbench.OrderForLoading(localePath,
+                         TranslationWorkbench.EnumerateLocaleFiles(modPath, locale))
+                         .Where(file => TranslationWorkbench.IsManualFileEnabled(modPath, localePath, file)))
             {
                 loadedFileCount++;
 
-                var content = Jsonc.ParseFile(file, m => logger.Error($"[文本汉化]{m}"));
+                var content = Jsonc.ParseFile(file, m => logger.Warning($"[文本汉化]{m}"), TranslationFiles.KeyComparer,
+                    m => logger.Error($"[文本汉化]{m}"));
                 if (content == null || content.Count == 0)
                 {
                     continue;
                 }
-                parsedFiles.Add((System.IO.Path.GetRelativePath(localePath, file), content));
+                try
+                {
+                    var relative = TranslationWorkbench.NormalizeRelative(localePath, file);
+                    var active = filterTracked(file, content);
+                    if (active.Count < content.Count)
+                        logger.Warning($"[文本汉化]译文文件 {relative} 有 {content.Count - active.Count} 条因原文基准变化而暂停应用，请校对后重新保存。");
+                    parsedFiles.Add((relative, active));
+                }
+                catch (Exception ex) { logger.Warning($"[文本汉化]已暂停无法校验原文基准的生成文件：{Path.GetFileName(file)}。{ServerLogText.Failure(ex)}"); }
             }
 
             // 全量合并（含每个键的覆盖链 provenance，供冲突报告与占位符归属使用）
@@ -196,7 +239,7 @@ public class SimpleTranslator(
                     {
                         newKeyFields++;
                     }
-                    report?.AddLocale(relativeFile, kvp.Key, kvp.Value, baseExists, isWinner, winnerFile);
+                    report?.AddLocale(relativeFile, kvp.Key, kvp.Value, baseExists, isWinner, winnerFile, targetAvailable);
                 }
 
                 if (!targetAvailable)
@@ -204,19 +247,8 @@ public class SimpleTranslator(
                     continue;
                 }
 
-                var fileName = System.IO.Path.GetFileName(relativeFile);
-                if (coveredFields == 0)
-                {
-                    nonCoveredFiles.Add(fileName);
-                }
-                else if (coveredFields < totalFields)
-                {
-                    partiallyCoveredFiles.Add((fileName, coveredFields, newKeyFields, totalFields));
-                }
-                else
-                {
-                    fullyCoveredFiles.Add(fileName);
-                }
+                if (totalFields > 0)
+                    fileCoverage.Add(new FileCoverage(relativeFile, coveredFields, newKeyFields, totalFields));
             }
 
             // 语言级写入统计：进入合并结果的每个键都会写入目标语言字典，
@@ -237,14 +269,11 @@ public class SimpleTranslator(
                 }
             }
 
-            if (merged.Values.Count == 0)
-            {
-                continue;
-            }
+
 
             if (!targetAvailable)
             {
-                logger.Warning($"目标语言 {locale} 在数据库中不存在，跳过该语言覆盖");
+                logger.Warning($"[文本汉化]数据库缺少目标语言 {locale}，已跳过该语言的译文。");
                 continue;
             }
             var lazyTarget = localeGlobal[locale];
@@ -253,7 +282,7 @@ public class SimpleTranslator(
             // 缺失归属到该键的胜出文件；最终以运行时 transformer 的警告日志为准，mod 物品的预览可能误报
             if (report != null)
             {
-                var preview = new Dictionary<string, string>(referenceLocales);
+                var preview = new Dictionary<string, string>(referenceLocales, TranslationFiles.KeyComparer);
                 if (targetLocaleRef != null)
                 {
                     foreach (var p in targetLocaleRef)
@@ -279,8 +308,11 @@ public class SimpleTranslator(
             // 每语言只注册一个 transformer。
             // transformer 在 locale 字典真正构建时才执行，此时其他 mod
             // 添加的物品名已进入字典，mod 物品也能正确解析
+            var initialApplyLogged = 0;
             lazyTarget.AddTransformer(targetDict =>
             {
+                // Discovery travels on the built-in locale route. A client without this mod
+                // never calls an optional /simpletranslator endpoint.
 #if SPT40
                 // 4.0 的 Global 字典就是普通的 Dictionary<string, string>
                 targetDict ??= new Dictionary<string, string>();
@@ -288,35 +320,53 @@ public class SimpleTranslator(
                 targetDict ??= new GlobalLocaleDictionary();
 #endif
 
-                // 先原样写入全部合并值：随后解析占位符时目标字典已含全部合并原始值
-                // 与游戏/其他 mod 条目，跨文件引用因此可见
-                foreach (var kvp in merged.Values)
-                {
-                    targetDict[kvp.Key] = kvp.Value;
-                }
+                if (locale == "ch") TranslationWorkbench.CaptureBaseTranslations(targetDict, merged.Values.Keys);
 
-                // 再统一对合并后的每个键做深度占位符解析
-                // （同一键的同一缺失 id 只警告一次，归属到胜出文件）
-                foreach (var kvp in merged.Values)
-                {
-                    var unresolved = kvp.Value.Contains("${") ? new List<string>() : null;
-                    targetDict[kvp.Key] = ItemPlaceholders.Resolve(kvp.Value, targetDict, referenceLocales, unresolved);
-                    if (unresolved != null)
-                    {
-                        foreach (var id in unresolved)
-                        {
-                            logger.Warning($"[文本汉化]占位符找不到物品名: {id}（{merged.WinningFile(kvp.Key)} 的键 \"{kvp.Key}\"），游戏内将显示为裸 id");
-                        }
-                    }
-                }
+                TranslationMerger.ApplyTo(targetDict, merged, referenceLocales, (key, id) =>
+                    logger.Warning($"[文本汉化]占位符未解析：{id}（{merged.WinningFile(key)}，键 {key}）。物品可能缺失、循环引用或超出解析预算，已保留原始 ID。"));
+                targetDict[SimpleTranslatorRouter.DiscoveryKey] = "SimpleTranslatorCS:2";
+                if (locale == "ch") ServerLocaleOverlay.Apply(targetDict);
+                if (merged.Values.Count > 0 && Interlocked.Exchange(ref initialApplyLogged, 1) == 0)
+                    LogColored(logger, $"文本汉化 | 已写入 {locale} 语言表：{merged.Values.Count} 个文件合并键。", Color.Green);
                 return targetDict;
             });
         }
 
-        LogStatistics(loadedFileCount, writtenLocalesByLang, fullyCoveredFiles, partiallyCoveredFiles, nonCoveredFiles, logger);
+        LogStatistics(loadedFileCount, writtenLocalesByLang, fileCoverage, logger);
 
         // 处理 dialogue 本地化
         LoadDialogueLocalizations(modPath, report);
+
+        try
+        {
+            var english = localeService.GetLocaleDb("en");
+            var chinese = localeService.GetLocaleDb("ch");
+#if SPT40
+            var templates = databaseServer.GetTables().Templates;
+            var traderIds = databaseServer.GetTables().Traders.Keys.Select(id => id.ToString());
+#else
+            var templates = templateTable;
+            var traderIds = tradersTable.Keys.Select(id => id.ToString());
+#endif
+            TranslationWorkbench.Initialize(
+                modPath,
+                english,
+                chinese,
+                templates.Items.Keys.Select(id => id.ToString()),
+                templates.Quests.Values.SelectMany(QuestLocaleKeys),
+                fikaDetected: fikaDetected,
+                adminKey: config.WorkbenchAdminKey,
+                pullCooldownSeconds: config.PullCooldownSeconds,
+                achievementKeys: templates.Achievements.Concat(templates.CustomAchievements ?? []).SelectMany(AchievementLocaleKeys),
+                traderIds: traderIds,
+                customizationIds: templates.Customization.Keys.Select(id => id.ToString()),
+                handbookKeys: templates.Handbook.Categories.Select(category => category.Id.ToString()),
+                includeOtherLocaleText: config.IncludeOtherLocaleText);
+        }
+        catch (Exception ex)
+        {
+            logger.Warning($"[文本汉化]工作台目录初始化失败。{ServerLogText.Failure(ex)}");
+        }
 
         // 开发模式：导出词条生效报告
         report?.WriteTo(System.IO.Path.Combine(modPath, config.ReportFile), m => logger.Info(m), m => logger.Error(m));
@@ -324,13 +374,110 @@ public class SimpleTranslator(
         return Task.CompletedTask;
     }
 
+    private static IEnumerable<string> QuestLocaleKeys(QuestTable quest)
+    {
+        yield return quest.Id.ToString();
+        foreach (var value in new[]
+                 {
+                     quest.Name, quest.Description, quest.FailMessageText, quest.Note, quest.Location,
+                     quest.StartedMessageText, quest.SuccessMessageText, quest.AcceptPlayerMessage,
+                     quest.AcceptanceAndFinishingSource, quest.DeclinePlayerMessage, quest.CompletePlayerMessage,
+                     quest.ChangeQuestMessageText
+                 })
+            if (!string.IsNullOrWhiteSpace(value))
+                yield return value;
+
+        foreach (var key in ConditionLocaleKeys(quest.Conditions))
+            yield return key;
+    }
+
+    private static IEnumerable<string> AchievementLocaleKeys(AchievementTable achievement)
+    {
+        var id = achievement.Id.ToString();
+        if (string.IsNullOrWhiteSpace(id))
+            yield break;
+        yield return id + " name";
+        yield return id + " description";
+        yield return id + " successMessage";
+        foreach (var key in ConditionLocaleKeys(achievement.Conditions))
+            yield return key;
+    }
+
+    private static readonly HashSet<string> ConditionChildProperties = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Started", "AvailableForFinish", "AvailableForStart", "Success", "Fail",
+        "Counter", "Conditions", "VisibilityConditions"
+    };
+
+    /// <summary>
+    /// Collect locale-capable IDs from quest/achievement condition trees. Traversal is restricted
+    /// to condition-container properties so reward, item and trader IDs elsewhere cannot leak into
+    /// the automatic translation catalog.
+    /// </summary>
+    internal static IReadOnlyCollection<string> ConditionLocaleKeys(object? root)
+    {
+        const int maxDepth = 12;
+        const int maxNodes = 50000;
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var nodes = 0;
+
+        void Visit(object? value, int depth)
+        {
+            if (value == null || depth > maxDepth || nodes++ >= maxNodes || value is string)
+                return;
+            if (value is IEnumerable sequence)
+            {
+                foreach (var item in sequence)
+                {
+                    Visit(item, depth + 1);
+                    if (nodes >= maxNodes)
+                        break;
+                }
+                return;
+            }
+
+            var type = value.GetType();
+            var idProperty = type.GetProperty("Id", BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
+            if (idProperty?.GetIndexParameters().Length == 0)
+            {
+                try
+                {
+                    var id = idProperty.GetValue(value)?.ToString();
+                    if (!string.IsNullOrWhiteSpace(id))
+                        result.Add(id);
+                }
+                catch
+                {
+                    // A malformed third-party condition must not prevent the remaining catalog.
+                }
+            }
+
+            foreach (var property in type.GetProperties(BindingFlags.Public | BindingFlags.Instance)
+                         .Where(property => ConditionChildProperties.Contains(property.Name)
+                                            && property.GetIndexParameters().Length == 0))
+            {
+                try
+                {
+                    Visit(property.GetValue(value), depth + 1);
+                }
+                catch
+                {
+                    // Skip an unreadable extension property and continue with sibling conditions.
+                }
+            }
+        }
+
+        Visit(root, 0);
+        return result;
+    }
+
     /// <summary>
     /// 开发模式：监听翻译目录的文件变更，提示译者修改需重启服务器生效。
-    /// （locale 字典构建后即固化，真正的热重载不可靠，故只做提示）
+    /// 当前尚未实现快照替换与缓存能力适配，所以这里只做提示；不是 SPT 不支持重载。
     /// </summary>
     private static void StartFileWatcher(string localePath, ISptLogger<SimpleTranslator> logger)
     {
-        if (_fileWatcher != null)
+        if (FileWatchers.ContainsKey(Path.GetFullPath(localePath)))
         {
             return; // 已启动
         }
@@ -358,7 +505,7 @@ public class SimpleTranslator(
                     return;
                 }
                 lastNotified[e.FullPath] = DateTime.Now;
-                logger.Info($"[文本汉化]检测到翻译文件变更: {e.FullPath} —— 重启服务器后生效");
+                logger.Info($"[文本汉化]检测到译文文件变更：{e.FullPath}。可用管理员工作台重载普通译文；对话（dialogue）变更需重启服务器。");
             }
 
             watcher.Changed += OnChanged;
@@ -366,11 +513,11 @@ public class SimpleTranslator(
             watcher.Deleted += OnChanged;
             watcher.Renamed += OnChanged;
 
-            _fileWatcher = watcher;
+            FileWatchers[Path.GetFullPath(localePath)] = watcher;
         }
         catch (Exception ex)
         {
-            logger.Warning($"[文本汉化]翻译文件监听启动失败: {ex.Message}");
+            logger.Warning($"[文本汉化]译文文件监听启动失败。{ServerLogText.Failure(ex)}");
         }
     }
 
@@ -387,55 +534,50 @@ public class SimpleTranslator(
 #endif
     }
 
-    /// <summary>
-    /// 记录和显示统计信息
-    /// </summary>
+    private sealed record FileCoverage(string Path, int Covered, int Added, int Total)
+    {
+        internal int Overridden => Total - Covered - Added;
+    }
+
     private static void LogStatistics(
-        int loadedFileCount,
-        Dictionary<string, (int written, int baseCovered, int added)> writtenLocalesByLang,
-        List<string> fullyCoveredFiles,
-        List<(string fileName, int covered, int added, int total)> partiallyCoveredFiles,
-        List<string> nonCoveredFiles,
+        int scannedFiles,
+        Dictionary<string, (int Written, int Covered, int Added)> byLanguage,
+        IReadOnlyList<FileCoverage> files,
         ISptLogger<SimpleTranslator> logger)
     {
-        logger.Info($"[文本汉化]总计 [{loadedFileCount}] 个汉化文本文件加载");
-
+        logger.Info($"[文本汉化]已尝试读取 {scannedFiles} 个启用的普通译文文件（不含对话）。");
         foreach (var locale in ServerLocales)
         {
-            var (written, baseCovered, added) = writtenLocalesByLang.TryGetValue(locale, out var s) ? s : (0, 0, 0);
-            logger.Info($"[文本汉化]  - {locale}: 写入 {written} 个键（覆盖基底 {baseCovered} / 新增键 {added}）");
-            logger.Info(string.Empty);
+            if (!byLanguage.TryGetValue(locale, out var counts))
+            {
+                logger.Info($"[文本汉化]语言 {locale} 没有注册可写入的普通译文键。");
+                continue;
+            }
+
+            logger.Info($"[文本汉化]语言 {locale} 已注册 {counts.Written} 个合并键，读取语言表时写入。");
+            if (counts.Covered > 0)
+                LogColored(logger, $"文本汉化 | 覆盖已有键：{counts.Covered} 个。", Color.Green);
+            if (counts.Added > 0)
+                LogColored(logger, $"文本汉化 | 新增键：{counts.Added} 个。若游戏没有引用这些键，界面可能不会显示。", Color.Cyan);
         }
 
-        if (fullyCoveredFiles.Count > 0)
+        foreach (var file in files)
         {
-            LogColored(logger, $"[文本汉化]完全覆盖 文本列表:", Color.Green);
-            foreach (var f in fullyCoveredFiles)
+            var path = SimpleTranslatorRouter.Clean(file.Path, 240);
+            if (file.Covered > 0)
             {
-                logger.Info($"  - {f} ");
+                var status = file.Covered == file.Total ? "全部覆盖" : "部分覆盖";
+                var color = file.Covered == file.Total ? Color.Green : Color.Yellow;
+                LogColored(logger, $"文本汉化 | {status}：{path}（覆盖 {file.Covered}/{file.Total}，新增 {file.Added}，被同键覆盖 {file.Overridden}）", color);
             }
-            logger.Info(string.Empty);
-        }
-
-        if (partiallyCoveredFiles.Count > 0)
-        {
-            LogColored(logger, $"[文本汉化]部分覆盖 文本列表:", Color.Yellow);
-            foreach (var f in partiallyCoveredFiles)
+            else if (file.Added > 0 && file.Overridden == 0)
             {
-                var overridden = f.total - f.covered - f.added;
-                logger.Info($"  - {f.fileName}（覆盖基底 {f.covered}/{f.total}；新增键 {f.added}；被同键覆盖 {overridden}）");
+                LogColored(logger, $"文本汉化 | 仅新增：{path}（新增 {file.Added}）", Color.Cyan);
             }
-            logger.Info(string.Empty);
-        }
-
-        if (nonCoveredFiles.Count > 0)
-        {
-            LogColored(logger, $"[文本汉化]未覆盖基底 文本列表（词条可能为新增键或被其他文件同键覆盖，详见报告）:", Color.Red);
-            foreach (var f in nonCoveredFiles)
+            else
             {
-                logger.Info($"  - {f}");
+                LogColored(logger, $"文本汉化 | 未覆盖已有键：{path}（新增 {file.Added}，被同键覆盖 {file.Overridden}）", Color.Yellow);
             }
-            logger.Info(string.Empty);
         }
     }
 
@@ -448,26 +590,29 @@ public class SimpleTranslator(
         {
             foreach (var locale in ServerLocales)
             {
-                var dialoguePath = System.IO.Path.Combine(modPath, "db", "locales", locale, "dialogue");
-                if (!Directory.Exists(dialoguePath))
-                {
-                    continue;
-                }
-
-                var dialogueFiles = TranslationFiles.EnumerateDialogueFiles(dialoguePath);
+                var dialoguePath = TranslationWorkbench.LocaleRoot(modPath, locale);
+                if (!TranslationWorkbench.LocaleRoots(modPath, locale).Any(Directory.Exists)) continue;
+                var dialogueFiles = TranslationWorkbench.LocaleRoots(modPath, locale).Where(Directory.Exists)
+                    .SelectMany(folder => Directory.EnumerateDirectories(folder, "*", new EnumerationOptions
+                        { RecurseSubdirectories = true, AttributesToSkip = FileAttributes.ReparsePoint }))
+                    .Where(path => Path.GetFileName(path).Equals("dialogue", StringComparison.OrdinalIgnoreCase))
+                    .SelectMany(TranslationFiles.EnumerateDialogueFiles).Distinct().ToArray();
 
                 // 收集并合并所有文件的内容（后面的文件覆盖前面的），同时记录每个键的来源文件。
-                // 比较器与目标容器一致，仅大小写不同的键也会按同一键合并并报冲突
-                var entries = new Dictionary<string, (string value, string file)>(TranslationFiles.KeyComparer);
-                foreach (var file in dialogueFiles)
+                // Dialogue 普通字典大小写敏感，两版均不得使用 Global 的 IgnoreCase 规则。
+                var entries = new Dictionary<string, (string value, string file)>(TranslationFiles.DialogueKeyComparer);
+                var localeRoot = TranslationWorkbench.LocaleRoot(modPath, locale);
+                foreach (var file in dialogueFiles.Where(file =>
+                             TranslationWorkbench.IsManualFileEnabled(modPath, localeRoot, file)))
                 {
-                    var content = Jsonc.ParseFile(file, m => logger.Error($"[文本汉化]{m}"));
+                    var content = Jsonc.ParseFile(file, m => logger.Warning($"[文本汉化][对话]{m}"),
+                        error: m => logger.Error($"[文本汉化][对话]{m}"));
                     if (content == null || content.Count == 0)
                     {
                         continue;
                     }
 
-                    var relativeFile = System.IO.Path.GetRelativePath(dialoguePath, file);
+                    var relativeFile = TranslationWorkbench.NormalizeRelative(dialoguePath, file);
                     foreach (var kvp in content)
                     {
                         if (entries.TryGetValue(kvp.Key, out var old) && old.file != relativeFile)
@@ -490,8 +635,8 @@ public class SimpleTranslator(
 #endif
 
                 // 占位符解析用的字典引用：目标语言优先，英文兜底
-                // （dialogue 在 OnLoad 阶段直接写库，拿不到 transformer 合并后的最终字典，
-                //   个别 mod 物品名缺失时会自动回退英文或裸 id）
+                // 此时已注册本 mod 的 transformer；再次读取可获得其结果。
+                // 更晚加载的 mod 仍不在当前视图内。
                 IReadOnlyDictionary<string, string>? targetLocaleRef = null;
                 IReadOnlyDictionary<string, string>? enLocaleRef = null;
                 try
@@ -511,13 +656,13 @@ public class SimpleTranslator(
                     targetLocaleRef,
                     enLocaleRef,
                     report,
-                    m => logger.Info(m),
+                    m => LogColored(logger, m, Color.Green),
                     m => logger.Warning(m));
             }
         }
         catch (Exception ex)
         {
-            logger.Error($"[Dialogue本地化]处理失败: {ex.Message}");
+            logger.Error($"[文本汉化][对话]加载失败。{ServerLogText.Failure(ex)}");
         }
     }
 }

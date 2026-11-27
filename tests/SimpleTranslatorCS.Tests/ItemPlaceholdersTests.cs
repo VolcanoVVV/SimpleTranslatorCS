@@ -134,7 +134,7 @@ public class ItemPlaceholdersTests
     }
 
     [TestMethod]
-    public void Resolve_CircularReference_StopsAtMaxDepthWithoutThrowing()
+    public void Resolve_CircularReference_FallsBackToBareId()
     {
         // A 的名字引用 B、B 的名字引用 A：必须在深度上限处停止，不死循环、不栈溢出
         var dict = new Dictionary<string, string>
@@ -146,8 +146,8 @@ public class ItemPlaceholdersTests
 
         var result = ItemPlaceholders.Resolve($"${{{IdA}}}", dict, null, unresolved);
 
-        // 超限后保留未解析的内层占位符，缺失 id 去重后记为未解析
-        StringAssert.Contains(result, "${");
+        // 环在展开时发现，统一回退裸 id，不把占位符语法显示给玩家。
+        Assert.AreEqual(IdA, result);
         Assert.AreEqual(1, unresolved.Count);
     }
 

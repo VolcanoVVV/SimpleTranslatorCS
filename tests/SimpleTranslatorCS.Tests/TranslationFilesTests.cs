@@ -113,15 +113,17 @@ public class TranslationFilesTests
     }
 
     [TestMethod]
-    public void KeyComparer_TestBuild_IsOrdinalIgnoreCase()
+    public void KeyComparer_MatchesTargetFramework()
     {
-        // 测试项目按 4.1（net10，无 SPT40 定义）编译，KeyComparer 应与目标容器
-        // GlobalLocaleDictionary 的实测比较规则 OrdinalIgnoreCase 一致。
-        // 4.0 路径（StringComparer.Ordinal）是编译期分支（#if SPT40），单测覆盖不到。
+#if SPT40
+        Assert.AreSame(StringComparer.Ordinal, TranslationFiles.KeyComparer);
+        Assert.IsFalse(TranslationFiles.KeyComparer.Equals("Key", "key"));
+#else
         Assert.AreSame(StringComparer.OrdinalIgnoreCase, TranslationFiles.KeyComparer);
         Assert.IsTrue(TranslationFiles.KeyComparer.Equals("Key", "key"));
         Assert.AreEqual(
             StringComparer.OrdinalIgnoreCase.GetHashCode("Key"),
             TranslationFiles.KeyComparer.GetHashCode("key"));
+#endif
     }
 }
